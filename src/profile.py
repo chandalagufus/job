@@ -7,24 +7,24 @@ from __future__ import annotations
 
 PROFILE = {
     "name": "candidate name",
-    "email": "candidate@example.com",
-    "location": "Candidate City, ST",
+    "email": "",
+    "location": "Fairfax, Virginia",
     "preferred_locations": [
-        "Candidate City, ST",
-        "Metro Area A",
-        "Metro Area B",
-        "State A",
-        "State B",
+        "Fairfax, Virginia",
+        "Atlanta, Georgia",
+        "Texas",
+        "Ohio",
+        "Pennsylvania",
     ],
     "location_addresses": {
-        "Candidate City, ST": "Candidate City, ST",
-        "Metro Area A": "Metro Area A",
-        "Metro Area B": "Metro Area B",
-        "State A": "State A",
-        "State B": "State B",
+        "Fairfax, Virginia": "Fairfax, Virginia",
+        "Atlanta / Georgia": "10 Ridge Run SE, Marietta, GA",
+        "Texas": "8011 N MacArthur Blvd, Irving, TX",
+        "Ohio": "1591 Charterwoods Circle, Fairborn, OH 45324",
+        "Pennsylvania / Philadelphia": "703 Norwood House Rd, Downingtown, PA 19335",
     },
     "experience_years": 3,
-    "education": "Candidate Degree / Program",
+    "education": "M.S. Data Analytics Engineering - George Mason University (GPA 3.97/4.0)",
     "target_roles": [
         "Data Scientist",
         "Data Engineer",
@@ -54,6 +54,9 @@ PROFILE = {
         "LLM Engineer",
         "Prompt Engineer",
     ],
+    "contact_phone": "",
+    "linkedin_url": "",
+    "github_url": "",
 }
 
 SKILLS_STRONG: set[str] = {

@@ -301,14 +301,14 @@ def _address_for_location(location: str) -> str:
     loc = (location or "").lower()
     addresses = PROFILE.get("location_addresses") or {}
     if any(token in loc for token in (" tx", "texas", "dallas", "plano", "irving", "houston", "austin")):
-        return str(addresses.get("Texas") or addresses.get("State A") or PROFILE.get("location") or "Candidate City, ST")
+        return str(addresses.get("Texas") or PROFILE.get("location") or "Fairfax, Virginia")
     if any(token in loc for token in (" philadelphia", "pennsylvania", "downingtown", ", pa")):
-        return str(addresses.get("Pennsylvania / Philadelphia") or addresses.get("State B") or PROFILE.get("location") or "Candidate City, ST")
+        return str(addresses.get("Pennsylvania / Philadelphia") or PROFILE.get("location") or "Fairfax, Virginia")
     if any(token in loc for token in (" atlanta", "georgia", " marietta", ", ga")):
-        return str(addresses.get("Atlanta / Georgia") or addresses.get("Metro Area A") or PROFILE.get("location") or "Candidate City, ST")
+        return str(addresses.get("Atlanta / Georgia") or PROFILE.get("location") or "Fairfax, Virginia")
     if any(token in loc for token in (" ohio", "fairborn", "columbus", "cleveland", "cincinnati", ", oh")):
-        return str(addresses.get("Ohio") or addresses.get("State B") or PROFILE.get("location") or "Candidate City, ST")
-    return str(addresses.get("Candidate City, ST") or PROFILE.get("location") or "Candidate City, ST")
+        return str(addresses.get("Ohio") or PROFILE.get("location") or "Fairfax, Virginia")
+    return str(addresses.get("Fairfax, Virginia") or PROFILE.get("location") or "Fairfax, Virginia")
 
 
 def _email_for_company(company: str) -> str:
@@ -376,9 +376,9 @@ def _fill_resume_template(
     project_items: list[dict[str, object]],
 ) -> str:
     filled = latex_template
-    contact_phone = str(PROFILE.get("contact_phone") or "+1 (555) 010-0000")
-    linkedin_url = str(PROFILE.get("linkedin_url") or "linkedin.com/in/candidate")
-    github_url = str(PROFILE.get("github_url") or "github.com/candidate")
+    contact_phone = str(PROFILE.get("contact_phone") or "")
+    linkedin_url = str(PROFILE.get("linkedin_url") or "")
+    github_url = str(PROFILE.get("github_url") or "")
     candidate_name = str(PROFILE.get("name") or "Candidate Name")
     filled = filled.replace("CANDIDATE_NAME", _latex_escape(candidate_name))
     filled = filled.replace("FAIRFAX_OR_ROLE_SPECIFIC_ADDRESS", _latex_escape(address))
