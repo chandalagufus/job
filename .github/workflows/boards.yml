@@ -1,0 +1,73 @@
+name: Job Radar — Board Sweep
+
+on:
+  schedule:
+    - cron: "30 * * * *"     # Every hour at :30 (offset so it doesn't clash with main)
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Boards per batch (default: 50)"
+        required: false
+        default: "50"
+      run_until_wrap:
+        description: "Full sweep (run until cursor wraps)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: job-radar-state
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run board sweep
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DB_PATH: state/gha-jobs.db
+        run: |
+          BATCH=${{ github.event.inputs.batch_size || '50' }}
+          WRAP=${{ github.event.inputs.run_until_wrap || 'false' }}
+          CMD="python -m src.main --mode boards --boards-batch-size $BATCH --notify-yes-only"
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "$WRAP" = "true" ]; then
+            CMD="$CMD --boards-run-until-wrap"
+          fi
+          eval $CMD
+
+      - name: Export dead boards report
+        env:
+          DB_PATH: state/gha-jobs.db
+        run: python -m src.main --mode boards --dry-run --export-dead-csv state/gha-dead_boards.csv
+        continue-on-error: true
+
+      - name: Commit state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/gha-jobs.db
+          if [ -f state/gha-dead_boards.csv ]; then git add state/gha-dead_boards.csv; fi
+          git diff --cached --quiet || git commit -m "chore: update boards state [skip ci]"
+          git push origin HEAD:${{ github.ref_name }}

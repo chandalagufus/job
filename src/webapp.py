@@ -1,0 +1,1543 @@
+"""Lightweight web UI for browsing jobs, toggling features, and generating resumes."""
+from __future__ import annotations
+
+import csv
+from datetime import datetime, timedelta, timezone
+import hashlib
+from html import escape
+import json
+import logging
+import re
+import threading
+from urllib.parse import parse_qs, quote
+from wsgiref.simple_server import make_server
+
+from .config import Config
+from .database import Database
+from .evaluation import evaluate_job
+from .job_intelligence import extract_workday_req_id
+from .resume_builder import generate_resume_packet
+from .sources.base import is_us_location
+
+PIPELINE_STATUSES = [
+    "new",
+    "shortlisted",
+    "resume_generated",
+    "applied",
+    "interview",
+    "offer",
+    "rejected",
+    "archived",
+]
+GRADE_SCORES = {
+    "A": 6,
+    "B": 5,
+    "C": 4,
+    "D": 3,
+    "E": 2,
+    "F": 1,
+}
+
+RECENT_JOB_DAYS = 1
+DATE_FORMATS = (
+    "%Y-%m-%dT%H:%M:%S%z",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S.%f%z",
+    "%Y-%m-%d",
+)
+
+log = logging.getLogger(__name__)
+
+
+def _slug(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", (text or "").strip().lower())
+    return cleaned.strip("-") or "job"
+
+
+def _parse_datetime(raw: str) -> datetime | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        normalized = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        pass
+    for fmt in DATE_FORMATS:
+        try:
+            dt = datetime.strptime(text, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _is_recent_job(job: dict, *, max_days: int = RECENT_JOB_DAYS) -> bool:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_days)
+    posted_dt = _parse_datetime(job.get("posted", ""))
+    if posted_dt is not None:
+        return posted_dt >= cutoff
+    first_seen_dt = _parse_datetime(job.get("first_seen", ""))
+    if first_seen_dt is not None:
+        return first_seen_dt >= cutoff
+    return True
+
+
+def _job_sort_dt(job: dict) -> datetime:
+    posted_dt = _parse_datetime(job.get("posted", ""))
+    if posted_dt is not None:
+        return posted_dt
+    first_seen_dt = _parse_datetime(job.get("first_seen", ""))
+    if first_seen_dt is not None:
+        return first_seen_dt
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _job_sort_ts(job: dict) -> float:
+    dt = _job_sort_dt(job)
+    if dt.year <= 1970:
+        return 0.0
+    return dt.timestamp()
+
+
+def _passes_freshness(job: dict, *, days_raw: str, max_days: int) -> bool:
+    if (job.get("source") or "").strip().lower() == "linkedin":
+        return _is_recent_job(job, max_days=1)
+    if days_raw == "all":
+        return True
+    return _is_recent_job(job, max_days=max_days)
+
+
+def _source_match(job: dict, source: str) -> bool:
+    if not source or source == "all":
+        return True
+    return (job.get("source") or "").strip().lower() == source
+
+
+def _sort_jobs(jobs: list[dict], sort_by: str) -> None:
+    if sort_by == "oldest":
+        jobs.sort(key=lambda job: (_job_sort_dt(job), job["score"]))
+        return
+    if sort_by == "score":
+        jobs.sort(key=lambda job: (int(job.get("score") or 0), _job_sort_dt(job)), reverse=True)
+        return
+    if sort_by == "rating":
+        jobs.sort(
+            key=lambda job: (
+                GRADE_SCORES.get((job.get("grade") or "F").upper(), 0),
+                int(job.get("score") or 0),
+                _job_sort_dt(job),
+            ),
+            reverse=True,
+        )
+        return
+    if sort_by == "source":
+        jobs.sort(
+            key=lambda job: (
+                (job.get("source") or "").strip().lower(),
+                -int(job.get("score") or 0),
+                -_job_sort_ts(job),
+            )
+        )
+        return
+    jobs.sort(key=lambda job: (_job_sort_dt(job), job["score"]), reverse=True)
+
+
+def _queue_match(job: dict, queue: str, status: str) -> bool:
+    pipeline_status = (job.get("pipeline_status") or "new").strip().lower()
+    if status and status != "all" and pipeline_status != status:
+        return False
+    if queue == "all":
+        return True
+    if queue == "active":
+        return pipeline_status not in {"archived", "rejected"}
+    if queue == "actionable":
+        return pipeline_status in {"new", "shortlisted", "resume_generated", "applied", "interview"}
+    return True
+
+
+def _feature_defaults(cfg: Config) -> dict[str, bool]:
+    return {
+        "scanner_main": cfg.features.scanner_main,
+        "scanner_boards": cfg.features.scanner_boards,
+        "notifications": cfg.features.notifications,
+        "manual_jd": cfg.features.manual_jd,
+        "resume_generation": cfg.features.resume_generation,
+    }
+
+
+def _job_structured(job: dict) -> dict[str, object]:
+    raw = (job.get("structured_json") or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _structured_signal_pills(job: dict) -> str:
+    data = _job_structured(job)
+    pills: list[str] = []
+    if not (job.get("description") or "").strip():
+        pills.append("<span class=\"pill\">No JD</span>")
+    remote_mode = str(data.get("remote_mode") or "").strip()
+    if remote_mode:
+        pills.append(f"<span class=\"pill\">{escape(remote_mode.title())}</span>")
+    salary_min = data.get("salary_min")
+    salary_max = data.get("salary_max")
+    salary_period = str(data.get("salary_period") or "year")
+    if isinstance(salary_min, int) and isinstance(salary_max, int):
+        pills.append(f"<span class=\"pill\">${salary_min:,} - ${salary_max:,}/{escape(salary_period)}</span>")
+    yoe_min = data.get("years_experience_min")
+    yoe_max = data.get("years_experience_max")
+    if isinstance(yoe_min, int):
+        if isinstance(yoe_max, int):
+            pills.append(f"<span class=\"pill\">{yoe_min}-{yoe_max} yrs</span>")
+        else:
+            pills.append(f"<span class=\"pill\">{yoe_min}+ yrs</span>")
+    if data.get("linkedin_verified"):
+        pills.append("<span class=\"pill\">Verified</span>")
+    if data.get("visa_sponsorship") is True:
+        pills.append("<span class=\"pill\">Visa sponsor</span>")
+    elif data.get("visa_sponsorship") is False:
+        pills.append("<span class=\"pill\">No visa sponsor</span>")
+    if data.get("security_clearance"):
+        pills.append("<span class=\"pill\">Clearance</span>")
+    employment_type = str(data.get("employment_type") or "").strip()
+    if employment_type:
+        pills.append(f"<span class=\"pill\">{escape(employment_type.title())}</span>")
+    return "".join(pills) or "<span class=\"muted\">No extracted signals.</span>"
+
+
+def _board_inventory_total(cfg: Config) -> int:
+    try:
+        from .main import _resolve_boards_csv
+    except Exception:
+        return 0
+    try:
+        path = _resolve_boards_csv(cfg.boards.csv)
+    except Exception:
+        return 0
+    total = 0
+    with open(path, encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            company = (row.get("company_name") or row.get("company") or "").strip()
+            platform = (row.get("platform") or "").strip().lower()
+            url = (row.get("board_url") or row.get("url") or "").strip()
+            ok_val = (row.get("ok") or "").strip().lower()
+            if ok_val and ok_val not in ("true", "1", "yes"):
+                continue
+            if company and platform and url:
+                total += 1
+    return total
+
+
+def _workday_legacy_duplicate_keys(jobs: list[dict]) -> set[str]:
+    by_req: dict[str, dict[str, set[str]]] = {}
+    for job in jobs:
+        if (job.get("source") or "").strip().lower() != "workday":
+            continue
+        key = str(job.get("key") or "")
+        req_id = extract_workday_req_id(key) or extract_workday_req_id(str(job.get("url") or ""))
+        if not req_id:
+            continue
+        bucket = by_req.setdefault(req_id, {"url_keys": set(), "canonical_keys": set()})
+        if ":url:" in key:
+            bucket["url_keys"].add(key)
+        else:
+            bucket["canonical_keys"].add(key)
+    hidden: set[str] = set()
+    for bucket in by_req.values():
+        if bucket["canonical_keys"] and bucket["url_keys"]:
+            hidden.update(bucket["url_keys"])
+    return hidden
+
+
+def _canonical_workday_key_for_hidden(hidden_key: str, jobs: list[dict]) -> str:
+    req_id = extract_workday_req_id(hidden_key)
+    if not req_id:
+        return ""
+    for job in jobs:
+        key = str(job.get("key") or "")
+        if key == hidden_key:
+            continue
+        if (job.get("source") or "").strip().lower() != "workday":
+            continue
+        if ":url:" in key:
+            continue
+        if extract_workday_req_id(key) == req_id:
+            return key
+    return ""
+
+
+def _layout(title: str, body: str) -> bytes:
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(title)}</title>
+  <style>
+    :root {{
+      --bg: #f6f4ed;
+      --panel: #fffdf8;
+      --ink: #1f2937;
+      --muted: #6b7280;
+      --line: #ddd6c7;
+      --good: #166534;
+      --warn: #b45309;
+      --bad: #991b1b;
+      --accent: #0f766e;
+    }}
+    body {{ margin: 0; font-family: Georgia, 'Times New Roman', serif; background: var(--bg); color: var(--ink); }}
+    .wrap {{ max-width: 1100px; margin: 0 auto; padding: 24px; }}
+    .nav {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }}
+    .nav a {{ color: var(--accent); text-decoration: none; font-weight: 700; }}
+    .card {{ background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-bottom: 18px; }}
+    .grid {{ display: grid; grid-template-columns: 2fr 1fr; gap: 18px; }}
+    .hero {{ display: grid; grid-template-columns: 1.8fr 1fr; gap: 18px; align-items: start; }}
+    .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }}
+    .stat {{ background: #fbfaf6; border: 1px solid var(--line); border-radius: 12px; padding: 14px; }}
+    .stat strong {{ display: block; font-size: 1.6rem; line-height: 1.1; }}
+    .stat span {{ color: var(--muted); font-size: 0.92rem; }}
+    .helper-list {{ margin: 10px 0 0; padding-left: 18px; color: var(--muted); }}
+    .table-wrap {{ overflow-x: auto; }}
+    .muted {{ color: var(--muted); }}
+    .score {{ font-weight: 700; }}
+    .yes {{ color: var(--good); }}
+    .maybe {{ color: var(--warn); }}
+    .no {{ color: var(--bad); }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }}
+    textarea, input[type=text], input[type=url], select {{
+      width: 100%; box-sizing: border-box; border: 1px solid var(--line);
+      border-radius: 10px; padding: 10px 12px; font: inherit; background: #fff;
+    }}
+    textarea {{ min-height: 220px; resize: vertical; }}
+    button {{
+      background: var(--accent); color: white; border: 0; border-radius: 999px;
+      padding: 10px 16px; font: inherit; cursor: pointer; font-weight: 700;
+    }}
+    .pill {{
+      display: inline-block; border: 1px solid var(--line); border-radius: 999px;
+      padding: 4px 10px; margin-right: 6px; margin-bottom: 6px; background: #fff;
+    }}
+    .split {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }}
+    pre {{
+      white-space: pre-wrap; word-break: break-word; background: #fbfaf6;
+      border: 1px solid var(--line); border-radius: 10px; padding: 14px;
+    }}
+    .actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }}
+    .actions label {{ min-width: 140px; flex: 1 1 140px; }}
+    .button-link {{
+      display: inline-block; background: var(--accent); color: white; border: 0; border-radius: 999px;
+      padding: 10px 16px; text-decoration: none; font-weight: 700;
+    }}
+    .artifact-actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; }}
+    .artifact-meta {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }}
+    @media (max-width: 880px) {{
+      .grid, .split, .hero {{ grid-template-columns: 1fr; }}
+      .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .wrap {{ padding: 16px; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="nav">
+      <a href="/">Jobs</a>
+      <a href="/health">Health</a>
+      <a href="/boards">Board Health</a>
+      <a href="/manual-jd">Paste JD</a>
+      <a href="/settings">Feature Switchboard</a>
+    </div>
+    {body}
+  </div>
+  <script>
+    window.copyText = function (id) {{
+      const node = document.getElementById(id);
+      if (!node) return;
+      const text = node.textContent || "";
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        navigator.clipboard.writeText(text);
+        return;
+      }}
+      const area = document.createElement("textarea");
+      area.value = text;
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      document.body.removeChild(area);
+    }};
+    document.addEventListener("change", function (event) {{
+      const target = event.target;
+      if (!target || target.tagName !== "SELECT") return;
+      const form = target.closest("form[data-autosubmit='true']");
+      if (!form) return;
+      if (typeof form.requestSubmit === "function") {{
+        form.requestSubmit();
+      }} else {{
+        form.submit();
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+    return html.encode("utf-8")
+
+
+def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int = 8080) -> None:
+    defaults = _feature_defaults(cfg)
+    scan_lock = threading.Lock()
+    scan_state: dict[str, object] = {
+        "running": False,
+        "mode": "",
+        "message": "No scan has been started from the web UI yet.",
+        "started_at": "",
+        "finished_at": "",
+    }
+
+    def _scan_snapshot() -> dict[str, object]:
+        with scan_lock:
+            return dict(scan_state)
+
+    def _set_scan_state(**updates) -> None:
+        with scan_lock:
+            scan_state.update(updates)
+
+    def _start_scan(mode: str) -> bool:
+        current = _scan_snapshot()
+        if current.get("running"):
+            return False
+
+        started_at = datetime.now(timezone.utc).isoformat()
+        batch_size = max(int(cfg.boards.batch_size or 0), 1)
+        if mode == "boards":
+            cursor = worker_db_cursor = Database(cfg.database.path).get_cursor("boards_main")
+            try:
+                worker_db_cursor = int(worker_db_cursor or 0)
+            except Exception:
+                worker_db_cursor = 0
+            finally:
+                Database(cfg.database.path).close()
+            message = (
+                f"Started next board batch at {started_at}. "
+                f"It will scan up to {batch_size} boards from the current cursor ({worker_db_cursor})."
+            )
+        elif mode == "all":
+            cursor = worker_db_cursor = Database(cfg.database.path).get_cursor("boards_main")
+            try:
+                worker_db_cursor = int(worker_db_cursor or 0)
+            except Exception:
+                worker_db_cursor = 0
+            finally:
+                Database(cfg.database.path).close()
+            message = (
+                f"Started full board sweep at {started_at}. "
+                f"It resumes from the current cursor ({worker_db_cursor}) and wraps until all boards are covered."
+            )
+        else:
+            message = f"Started main sources scan at {started_at}."
+        _set_scan_state(
+            running=True,
+            mode=mode,
+            started_at=started_at,
+            finished_at="",
+            message=message,
+        )
+
+        def _worker() -> None:
+            from .main import _resolve_boards_csv, build_notifier, run_boards, run_main
+
+            worker_db = Database(cfg.database.path)
+            notifier = build_notifier(cfg)
+            try:
+                if mode in {"main", "all"}:
+                    run_main(cfg, worker_db, notifier, dry_run=False, no_notify=False, test_notify=False)
+                if mode in {"boards", "all"}:
+                    boards_csv = _resolve_boards_csv(cfg.boards.csv)
+                    run_boards(
+                        cfg,
+                        worker_db,
+                        notifier,
+                        boards_csv=boards_csv,
+                        batch_size=cfg.boards.batch_size,
+                        timeout=cfg.boards.timeout,
+                        workers=cfg.boards.workers,
+                        dry_run=False,
+                        no_notify=False,
+                        test_notify=False,
+                        run_until_wrap=(mode == "all"),
+                        show_live_progress=False,
+                    )
+                finished_at = datetime.now(timezone.utc).isoformat()
+                message = (
+                    "Completed main sources + full board sweep from the saved cursor."
+                    if mode == "all"
+                    else "Completed main source scan."
+                    if mode == "main"
+                    else "Completed next board batch scan."
+                )
+                _set_scan_state(
+                    running=False,
+                    finished_at=finished_at,
+                    message=f"{message} Finished at {finished_at}.",
+                )
+            except Exception as exc:
+                finished_at = datetime.now(timezone.utc).isoformat()
+                log.exception("Web-triggered scan failed: %s", exc)
+                _set_scan_state(
+                    running=False,
+                    finished_at=finished_at,
+                    message=f"Scan failed at {finished_at}: {type(exc).__name__}: {exc}",
+                )
+            finally:
+                worker_db.close()
+
+        thread = threading.Thread(target=_worker, name=f"job-radar-scan-{mode}", daemon=True)
+        thread.start()
+        return True
+
+    def _read_post(environ) -> dict[str, str]:
+        try:
+            size = int(environ.get("CONTENT_LENGTH") or "0")
+        except ValueError:
+            size = 0
+        raw = environ["wsgi.input"].read(size).decode("utf-8") if size > 0 else ""
+        parsed = parse_qs(raw, keep_blank_values=True)
+        return {k: v[-1] if v else "" for k, v in parsed.items()}
+
+    def _redirect(start_response, location: str):
+        start_response("303 See Other", [("Location", location)])
+        return [b""]
+
+    def _html_headers() -> list[tuple[str, str]]:
+        return [
+            ("Content-Type", "text/html; charset=utf-8"),
+            ("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0"),
+            ("Pragma", "no-cache"),
+            ("Expires", "0"),
+        ]
+
+    def _artifact_content_type(format_name: str) -> str:
+        normalized = (format_name or "").strip().lower()
+        if normalized == "markdown":
+            return "text/markdown; charset=utf-8"
+        if normalized == "tex":
+            return "application/x-tex; charset=utf-8"
+        return "text/plain; charset=utf-8"
+
+    def _packet_link(item: dict) -> str:
+        if (item.get("format") or "").strip().lower() == "prompt_packet":
+            return f"/packet?id={item['id']}"
+        return f"/resume?id={item['id']}"
+
+    def _flags() -> dict[str, bool]:
+        return db.get_feature_flags(defaults)
+
+    def _persist_evaluation(job: dict) -> tuple[dict, object]:
+        db.refresh_job_intelligence(
+            key=job["key"],
+            source=job["source"],
+            company=job["company"],
+            title=job["title"],
+            location=job["location"],
+            url=job["url"],
+            description=job.get("description", ""),
+        )
+        job = db.get_job(job["key"]) or job
+        evaluation = evaluate_job(
+            job["title"],
+            job.get("description", ""),
+            company=job["company"],
+            location=job["location"],
+            source=job.get("source", ""),
+            require_us_location=cfg.filter.require_us_location,
+        )
+        current_json = job.get("evaluation_json") or ""
+        if (
+            evaluation.fit_summary != (job.get("fit_summary") or "")
+            or evaluation.score != job["score"]
+            or evaluation.label != job["label"]
+            or evaluation.grade != (job.get("grade") or "")
+            or evaluation.to_json() != current_json
+        ):
+            db.update_job_evaluation(
+                key=job["key"],
+                score=evaluation.score,
+                label=evaluation.label,
+                grade=evaluation.grade,
+                evaluation_json=evaluation.to_json(),
+                fit_summary=evaluation.fit_summary,
+                description=job.get("description", ""),
+            )
+            job = db.get_job(job["key"]) or job
+        return job, evaluation
+
+    def _current_view_jobs(filters: dict[str, str]) -> tuple[list[dict], int, list[dict], set[str]]:
+        days_raw = (filters.get("days") or str(RECENT_JOB_DAYS)).strip()
+        queue = (filters.get("queue") or "active").strip().lower()
+        status = (filters.get("status") or "all").strip().lower()
+        source = (filters.get("source") or "all").strip().lower()
+        sort_by = (filters.get("sort") or "newest").strip().lower()
+        try:
+            days = max(int(days_raw), 1)
+        except ValueError:
+            days = RECENT_JOB_DAYS
+
+        filtered_jobs = [
+            job for job in db.list_jobs_for_board(limit=None)
+            if _queue_match(job, queue, status)
+            and _passes_freshness(job, days_raw=days_raw, max_days=days)
+            and _source_match(job, source)
+        ]
+        hidden_non_us_count = 0
+        if cfg.filter.require_us_location:
+            hidden_non_us_count = sum(
+                1 for job in filtered_jobs
+                if not is_us_location(job.get("location", ""))
+            )
+            filtered_jobs = [
+                job for job in filtered_jobs
+                if is_us_location(job.get("location", ""))
+            ]
+
+        all_jobs = _dedupe_board_jobs(filtered_jobs)
+        hidden_workday_keys = _workday_legacy_duplicate_keys(all_jobs)
+        jobs = [
+            job for job in all_jobs
+            if job.get("key") not in hidden_workday_keys
+        ]
+        _sort_jobs(jobs, sort_by)
+        return jobs, hidden_non_us_count, all_jobs, hidden_workday_keys
+
+    def _filtered_jobs_snapshot(filters: dict[str, str], *, limit: int = 500) -> list[dict]:
+        jobs, _, _, _ = _current_view_jobs(filters)
+        return jobs[: max(limit, 1)]
+
+    def _batch_refresh(jobs: list[dict]) -> int:
+        for job in jobs:
+            if job is None:
+                continue
+            db.refresh_job_intelligence(
+                key=job["key"],
+                source=job["source"],
+                company=job["company"],
+                title=job["title"],
+                location=job["location"],
+                url=job["url"],
+                description=job.get("description", ""),
+            )
+            refreshed = db.get_job(job["key"]) or job
+            evaluation = evaluate_job(
+                refreshed["title"],
+                refreshed.get("description", ""),
+                company=refreshed["company"],
+                location=refreshed["location"],
+                source=refreshed.get("source", ""),
+                require_us_location=cfg.filter.require_us_location,
+            )
+            db.update_job_evaluation(
+                key=job["key"],
+                score=evaluation.score,
+                label=evaluation.label,
+                grade=evaluation.grade,
+                evaluation_json=evaluation.to_json(),
+                fit_summary=evaluation.fit_summary,
+                description=refreshed.get("description", ""),
+            )
+        return len(jobs)
+
+    def _dedupe_board_jobs(rows: list[dict]) -> list[dict]:
+        best: dict[tuple[str, str, str], dict] = {}
+        for row in rows:
+            fingerprint = (
+                (row.get("source") or "").strip().lower(),
+                (row.get("company") or "").strip().lower(),
+                (row.get("title") or "").strip().lower(),
+            )
+            current = best.get(fingerprint)
+            if current is None:
+                best[fingerprint] = row
+                continue
+            current_desc_len = len((current.get("description") or "").strip())
+            row_desc_len = len((row.get("description") or "").strip())
+            current_stamp = current.get("last_seen") or current.get("first_seen") or ""
+            row_stamp = row.get("last_seen") or row.get("first_seen") or ""
+            if row_desc_len > current_desc_len or (row_desc_len == current_desc_len and row_stamp > current_stamp):
+                best[fingerprint] = row
+        return list(best.values())
+
+    def _jobs_page(start_response, query: dict[str, list[str]]):
+        days_raw = (query.get("days") or [str(RECENT_JOB_DAYS)])[-1]
+        queue = ((query.get("queue") or ["active"])[-1] or "active").strip().lower()
+        status = ((query.get("status") or ["all"])[-1] or "all").strip().lower()
+        source = ((query.get("source") or ["all"])[-1] or "all").strip().lower()
+        sort_by = ((query.get("sort") or ["newest"])[-1] or "newest").strip().lower()
+        rescore_limit_raw = (query.get("rescore_limit") or ["500"])[-1]
+        page_message = ((query.get("message") or [""])[-1] or "").strip()
+        try:
+            days = max(int(days_raw), 1)
+        except ValueError:
+            days = RECENT_JOB_DAYS
+        try:
+            rescore_limit = max(int(rescore_limit_raw), 1)
+        except ValueError:
+            rescore_limit = 500
+            rescore_limit_raw = "500"
+        jobs, hidden_non_us_count, all_jobs, hidden_workday_keys = _current_view_jobs(
+            {
+                "days": days_raw,
+                "queue": queue,
+                "status": status,
+                "source": source,
+                "sort": sort_by,
+            }
+        )
+        source_names = sorted({(job.get("source") or "").strip().lower() for job in jobs if (job.get("source") or "").strip()})
+        rows: list[str] = []
+        for job in jobs:
+            label = escape(job["label"])
+            grade = escape(job.get("grade") or "F")
+            pipeline_status = escape(job.get("pipeline_status") or "new")
+            role_bits = [
+                f"<a href=\"/job?key={quote(job['key'], safe='')}\">{escape(job['title'])}</a>",
+                f"<div class=\"muted\">{escape(job['company'])}</div>",
+            ]
+            if int(job.get("is_repost") or 0):
+                role_bits.append("<div><span class=\"pill\">Likely repost</span></div>")
+            quality_score = int(job.get("employer_quality_score") or 0)
+            rows.append(
+                "<tr>"
+                f"<td><input type=\"checkbox\" name=\"job_key\" value=\"{escape(job['key'])}\"></td>"
+                f"<td>{''.join(role_bits)}</td>"
+                f"<td>{escape(job['location'])}</td>"
+                f"<td><span class=\"score {label}\">{job['score']}</span></td>"
+                f"<td>{grade}</td>"
+                f"<td class=\"{label}\">{label.upper()}</td>"
+                f"<td>{quality_score}</td>"
+                f"<td>{_structured_signal_pills(job)}</td>"
+                f"<td>{pipeline_status}</td>"
+                f"<td>{escape(job['source'])}</td>"
+                "</tr>"
+            )
+        rows_html = "".join(rows) if rows else "<tr><td colspan=\"10\">No jobs match the current filters.</td></tr>"
+        queue_options = "".join(
+            f"<option value=\"{name}\"{' selected' if queue == name else ''}>{label}</option>"
+            for name, label in (("active", "Active"), ("actionable", "Actionable"), ("all", "All"))
+        )
+        status_options = "".join(
+            f"<option value=\"{name}\"{' selected' if status == name else ''}>{label}</option>"
+            for name, label in (("all", "All statuses"),) + tuple((item, item.replace('_', ' ').title()) for item in PIPELINE_STATUSES)
+        )
+        source_options = "".join(
+            f"<option value=\"{escape(name)}\"{' selected' if source == name else ''}>{escape(name.title())}</option>"
+            for name in ["all", *source_names]
+        )
+        day_options = "".join(
+            f"<option value=\"{value}\"{' selected' if days_raw == value else ''}>{label}</option>"
+            for value, label in (("1", "24 hours"), ("3", "3 days"), ("7", "7 days"), ("14", "14 days"), ("all", "All"))
+        )
+        sort_options = "".join(
+            f"<option value=\"{name}\"{' selected' if sort_by == name else ''}>{label}</option>"
+            for name, label in (
+                ("newest", "Newest"),
+                ("oldest", "Oldest"),
+                ("score", "Score"),
+                ("rating", "Rating"),
+                ("source", "Source"),
+            )
+        )
+        scan = _scan_snapshot()
+        scan_mode = escape(str(scan.get("mode") or ""))
+        scan_message = escape(str(scan.get("message") or ""))
+        scan_started = escape(str(scan.get("started_at") or ""))
+        scan_finished = escape(str(scan.get("finished_at") or ""))
+        scan_state_label = "Running" if scan.get("running") else "Idle"
+        board_total = _board_inventory_total(cfg)
+        try:
+            boards_cursor = int(db.get_cursor("boards_main") or 0)
+        except Exception:
+            boards_cursor = 0
+        shown_yes = sum(1 for job in jobs if (job.get("label") or "").strip().lower() == "yes")
+        shown_maybe = sum(1 for job in jobs if (job.get("label") or "").strip().lower() == "maybe")
+        shown_no = sum(1 for job in jobs if (job.get("label") or "").strip().lower() == "no")
+        active_sources = len({(job.get("source") or "").strip().lower() for job in jobs if (job.get("source") or "").strip()})
+        hidden_notes: list[str] = []
+        if hidden_workday_keys:
+            hidden_notes.append(f"{len(hidden_workday_keys)} legacy Workday duplicate(s)")
+        if hidden_non_us_count:
+            hidden_notes.append(f"{hidden_non_us_count} non-US job(s)")
+        hidden_workday_note = (
+            f"<p class=\"muted\">Hidden automatically: {', '.join(hidden_notes)}.</p>"
+            if hidden_notes
+            else ""
+        )
+        page_message_html = f"<p><strong>{escape(page_message)}</strong></p>" if page_message else ""
+        rescore_options = "".join(
+            f"<option value=\"{value}\"{' selected' if rescore_limit_raw == value else ''}>{label}</option>"
+            for value, label in (("100", "100 jobs"), ("250", "250 jobs"), ("500", "500 jobs"), ("1000", "1000 jobs"))
+        )
+        body = (
+            "<div class=\"card\">"
+            "<div class=\"hero\">"
+            "<div>"
+            "<h1>Job Review Board</h1>"
+            "<p class=\"muted\">Review fresh roles, update your pipeline quickly, and run scans without leaving the page.</p>"
+            "<ul class=\"helper-list\">"
+            "<li><strong>Scan Main Sources</strong> refreshes direct company feeds like Amazon, Microsoft, and Google.</li>"
+            "<li><strong>Scan Next Board Batch</strong> checks the next saved ATS slice for a quick incremental update.</li>"
+            "<li><strong>Scan Full Board Sweep</strong> resumes from the current cursor and wraps until every board is covered.</li>"
+            "</ul>"
+            "</div>"
+            "<div class=\"card\">"
+            "<h2>Scanner Status</h2>"
+            f"<p class=\"muted\">State: <strong>{scan_state_label}</strong>"
+            + (f" | Mode: <strong>{scan_mode}</strong>" if scan_mode else "")
+            + "</p>"
+            f"<p class=\"muted\">{scan_message}</p>"
+            + (f"<p class=\"muted\">Started: {scan_started}</p>" if scan_started else "")
+            + (f"<p class=\"muted\">Finished: {scan_finished}</p>" if scan_finished else "")
+            + f"<p class=\"muted\">Current board cursor: <strong>{boards_cursor}</strong> / {board_total or 'unknown'}</p>"
+            + "</div>"
+            "</div>"
+            "<div class=\"stats\">"
+            f"<div class=\"stat\"><strong>{len(jobs)}</strong><span>Jobs shown</span></div>"
+            f"<div class=\"stat\"><strong>{shown_yes}</strong><span>Yes matches</span></div>"
+            f"<div class=\"stat\"><strong>{shown_maybe}</strong><span>Maybe matches</span></div>"
+            f"<div class=\"stat\"><strong>{shown_no}</strong><span>No matches</span></div>"
+            "</div>"
+            f"<p class=\"muted\">Showing {len(jobs)} jobs from {len(all_jobs)} stored roles across {active_sources} source(s) in the current view.</p>"
+            f"{page_message_html}"
+            f"{hidden_workday_note}"
+            "<div class=\"card\">"
+            "<h2>Run Scanner</h2>"
+            "<form method=\"post\" action=\"/scan\" class=\"actions\">"
+            f"<input type=\"hidden\" name=\"days\" value=\"{escape(days_raw)}\">"
+            f"<input type=\"hidden\" name=\"queue\" value=\"{escape(queue)}\">"
+            f"<input type=\"hidden\" name=\"source\" value=\"{escape(source)}\">"
+            f"<input type=\"hidden\" name=\"status\" value=\"{escape(status)}\">"
+            f"<input type=\"hidden\" name=\"sort\" value=\"{escape(sort_by)}\">"
+            f"<input type=\"hidden\" name=\"rescore_limit\" value=\"{escape(rescore_limit_raw)}\">"
+            "<button type=\"submit\" name=\"scan_mode\" value=\"main\">Scan Main Sources</button>"
+            "<button type=\"submit\" name=\"scan_mode\" value=\"boards\">Scan Next Board Batch</button>"
+            "<button type=\"submit\" name=\"scan_mode\" value=\"all\">Scan Full Board Sweep</button>"
+            "</form>"
+            "<p class=\"muted\">Use the batch scan for a fast refresh. Use the full sweep when you want the whole ATS inventory refreshed from the saved cursor.</p>"
+            "</div>"
+            "<div class=\"card\">"
+            "<h2>Filter Jobs</h2>"
+            "<form method=\"get\" action=\"/\" class=\"actions\" data-autosubmit=\"true\">"
+            f"<label>Queue<br><select name=\"queue\">{queue_options}</select></label>"
+            f"<label>Freshness<br><select name=\"days\">{day_options}</select></label>"
+            f"<label>Source<br><select name=\"source\">{source_options}</select></label>"
+            f"<label>Status<br><select name=\"status\">{status_options}</select></label>"
+            f"<label>Sort<br><select name=\"sort\">{sort_options}</select></label>"
+            "<button type=\"submit\">Apply Filters</button>"
+            "</form>"
+            "<form method=\"post\" action=\"/jobs/re-evaluate\" class=\"actions\">"
+            f"<input type=\"hidden\" name=\"days\" value=\"{escape(days_raw)}\">"
+            f"<input type=\"hidden\" name=\"queue\" value=\"{escape(queue)}\">"
+            f"<input type=\"hidden\" name=\"source\" value=\"{escape(source)}\">"
+            f"<input type=\"hidden\" name=\"status\" value=\"{escape(status)}\">"
+            f"<input type=\"hidden\" name=\"sort\" value=\"{escape(sort_by)}\">"
+            f"<label>Re-score Batch<br><select name=\"rescore_limit\">{rescore_options}</select></label>"
+            "<button type=\"submit\">Batch Re-score Jobs</button>"
+            "</form>"
+            "</div>"
+            "</div>"
+            "<div class=\"card\">"
+            "<form method=\"post\" action=\"/jobs/bulk-update\">"
+            f"<input type=\"hidden\" name=\"days\" value=\"{escape(days_raw)}\">"
+            f"<input type=\"hidden\" name=\"queue\" value=\"{escape(queue)}\">"
+            f"<input type=\"hidden\" name=\"source\" value=\"{escape(source)}\">"
+            f"<input type=\"hidden\" name=\"status\" value=\"{escape(status)}\">"
+            f"<input type=\"hidden\" name=\"sort\" value=\"{escape(sort_by)}\">"
+            f"<input type=\"hidden\" name=\"rescore_limit\" value=\"{escape(rescore_limit_raw)}\">"
+            "<div class=\"actions\">"
+            "<label>Bulk Status<br><select name=\"bulk_status\">"
+            + "".join(f"<option value=\"{escape(item)}\">{escape(item.replace('_', ' ').title())}</option>" for item in PIPELINE_STATUSES)
+            + "</select></label>"
+            "<button type=\"submit\">Update Selected Jobs</button>"
+            "</div>"
+            "<div class=\"table-wrap\">"
+            "<table><thead><tr><th>Select</th><th>Role</th><th>Location</th><th>Score</th><th>Grade</th><th>Label</th><th>Employer</th><th>Signals</th><th>Status</th><th>Source</th></tr></thead>"
+            f"<tbody>{rows_html}</tbody></table>"
+            "</div>"
+            "</form>"
+            "</div>"
+        )
+        start_response("200 OK", _html_headers())
+        return [_layout("Jobs", body)]
+
+    def _job_page(start_response, key: str):
+        all_jobs = db.list_jobs_for_board(limit=4000)
+        hidden_workday_keys = _workday_legacy_duplicate_keys(all_jobs)
+        if key in hidden_workday_keys:
+            canonical_key = _canonical_workday_key_for_hidden(key, all_jobs)
+            if canonical_key:
+                return _redirect(start_response, f"/job?key={quote(canonical_key, safe='')}")
+        job = db.get_job(key)
+        if job is None:
+            start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+            return [b"Job not found."]
+
+        job, evaluation = _persist_evaluation(job)
+
+        flags = _flags()
+        resumes = db.list_generated_resumes(job["key"])
+        skill_pills = "".join(f"<span class=\"pill\">{escape(skill)}</span>" for skill in (evaluation.matched_strong + evaluation.matched_moderate)[:16])
+        reasons = "".join(f"<li>{escape(reason)}</li>" for reason in evaluation.reasons)
+        dimensions_html = "".join(
+            "<tr>"
+            f"<td>{escape(dim.name.replace('_', ' ').title())}</td>"
+            f"<td>{int(dim.weight * 100)}%</td>"
+            f"<td>{dim.score}</td>"
+            f"<td>{round(dim.weighted_points, 1)}</td>"
+            f"<td>{escape(dim.reason)}</td>"
+            "</tr>"
+            for dim in evaluation.dimensions
+        )
+        resume_block = (
+            "".join(
+                f"<li><a href=\"{_packet_link(item)}\">Prompt packet #{item['id']}</a> <span class=\"muted\">{escape(item['created_at'])}</span></li>"
+                for item in resumes
+            ) or "<li>No generated prompt packet yet.</li>"
+        )
+        skill_match_html = skill_pills or "<span class=\"muted\">No overlapping skills found from the stored text.</span>"
+        structured = _job_structured(job)
+        structured_rows = []
+        for field, label in (
+            ("remote_mode", "Remote Mode"),
+            ("salary_min", "Salary Min"),
+            ("salary_max", "Salary Max"),
+            ("salary_currency", "Salary Currency"),
+            ("salary_period", "Salary Period"),
+            ("years_experience_min", "Experience Min"),
+            ("years_experience_max", "Experience Max"),
+            ("visa_sponsorship", "Visa Sponsorship"),
+            ("security_clearance", "Security Clearance"),
+            ("employment_type", "Employment Type"),
+        ):
+            if field not in structured:
+                continue
+            value = structured[field]
+            if isinstance(value, bool):
+                display = "Yes" if value else "No"
+            elif isinstance(value, int) and field.startswith("salary_"):
+                display = f"${value:,}"
+            else:
+                display = str(value)
+            structured_rows.append(f"<tr><td>{escape(label)}</td><td>{escape(display)}</td></tr>")
+        structured_rows_html = "".join(structured_rows) or "<tr><td colspan=\"2\">No structured fields extracted yet.</td></tr>"
+        repost_html = (
+            f"<span class=\"pill\">Likely repost of <a href=\"/job?key={quote(job.get('repost_of_key') or '', safe='')}\">{escape(job.get('repost_of_key') or '')}</a></span>"
+            if int(job.get("is_repost") or 0) and (job.get("repost_of_key") or "")
+            else "<span class=\"pill\">Not marked as a repost</span>"
+        )
+
+        generate_form = ""
+        if flags.get("resume_generation", True):
+            generate_form = (
+                "<form method=\"post\" action=\"/job/generate-resume\">"
+                f"<input type=\"hidden\" name=\"key\" value=\"{escape(job['key'])}\">"
+                "<button type=\"submit\">Generate Prompt Packet</button>"
+                "</form>"
+            )
+        resume_action_html = generate_form or "<p class=\"muted\">Resume generation is disabled in the feature switchboard.</p>"
+        current_status = job.get("pipeline_status") or "new"
+        status_options = "".join(
+            f"<option value=\"{escape(status)}\"{' selected' if status == current_status else ''}>{escape(status.replace('_', ' ').title())}</option>"
+            for status in PIPELINE_STATUSES
+        )
+
+        body = (
+            "<div class=\"grid\">"
+            "<div>"
+            "<div class=\"card\">"
+            f"<h1>{escape(job['title'])}</h1>"
+            f"<p class=\"muted\">{escape(job['company'])} | {escape(job['location'])} | {escape(job['source'])}</p>"
+            f"<p><span class=\"score {escape(job['label'])}\">Score {job['score']}</span> | Grade <strong>{escape(job.get('grade') or evaluation.grade)}</strong> | <strong>{escape(job['label']).upper()}</strong></p>"
+            f"<p><span class=\"pill\">Employer Quality {int(job.get('employer_quality_score') or 0)}</span> {repost_html}</p>"
+            f"<p>{escape(job.get('fit_summary') or evaluation.fit_summary)}</p>"
+            f"<ul>{reasons}</ul>"
+            f"<p><a href=\"{escape(job['url'])}\" target=\"_blank\" rel=\"noreferrer\">Open original posting</a></p>"
+            "</div>"
+            "<div class=\"card\">"
+            "<h2>Weighted Evaluation</h2>"
+            "<table><thead><tr><th>Dimension</th><th>Weight</th><th>Score</th><th>Points</th><th>Reason</th></tr></thead>"
+            f"<tbody>{dimensions_html}</tbody></table>"
+            "</div>"
+            "<div class=\"card\">"
+            "<h2>Stored Job Description</h2>"
+            f"<pre>{escape(job.get('description') or 'No job description stored yet for this job.')}</pre>"
+            "</div>"
+            "<div class=\"card\">"
+            "<h2>Structured Extraction</h2>"
+            "<table><thead><tr><th>Field</th><th>Value</th></tr></thead>"
+            f"<tbody>{structured_rows_html}</tbody></table>"
+            "</div>"
+            "</div>"
+            "<div>"
+            "<div class=\"card\">"
+            "<h2>Skill Match</h2>"
+            f"<div>{skill_match_html}</div>"
+            "</div>"
+            "<div class=\"card\">"
+            "<h2>Inventory Signals</h2>"
+            f"<p>{_structured_signal_pills(job)}</p>"
+            f"<p class=\"muted\">{escape(job.get('employer_quality_reason') or '')}</p>"
+            "</div>"
+            "<div class=\"card\">"
+            "<h2>Prompt Packet Actions</h2>"
+            f"{resume_action_html}"
+            "<h3>Generated Prompt Packets</h3>"
+            f"<ul>{resume_block}</ul>"
+            "</div>"
+            "<div class=\"card\">"
+            "<h2>Pipeline Tracker</h2>"
+            "<form method=\"post\" action=\"/job/pipeline\">"
+            f"<input type=\"hidden\" name=\"key\" value=\"{escape(job['key'])}\">"
+            f"<label>Status<br><select name=\"pipeline_status\">{status_options}</select></label>"
+            f"<label>Follow Up Date<br><input type=\"text\" name=\"follow_up_date\" value=\"{escape(job.get('follow_up_date') or '')}\" placeholder=\"YYYY-MM-DD\"></label>"
+            f"<label>Notes<br><textarea name=\"pipeline_notes\">{escape(job.get('pipeline_notes') or '')}</textarea></label>"
+            "<div class=\"actions\"><button type=\"submit\">Save Pipeline Status</button></div>"
+            "</form>"
+            f"<p class=\"muted\">Last updated: {escape(job.get('pipeline_updated_at') or 'never')}</p>"
+            "</div>"
+            "</div>"
+            "</div>"
+        )
+        start_response("200 OK", _html_headers())
+        return [_layout(job["title"], body)]
+
+    def _manual_page(start_response, values: dict[str, str] | None = None, message: str = ""):
+        flags = _flags()
+        if not flags.get("manual_jd", True):
+            body = "<div class=\"card\"><h1>Paste JD</h1><p class=\"muted\">Manual JD scoring is disabled in the feature switchboard.</p></div>"
+            start_response("200 OK", _html_headers())
+            return [_layout("Paste JD", body)]
+
+        values = values or {}
+        body = (
+            "<div class=\"card\">"
+            "<h1>Paste an External Job Description</h1>"
+            "<p class=\"muted\">Use this for roles that did not come from the scanner. The job is scored, saved, and can then generate a resume draft.</p>"
+            f"<p>{escape(message)}</p>"
+            "<form method=\"post\" action=\"/manual-jd\">"
+            "<div class=\"split\">"
+            f"<label>Company<br><input type=\"text\" name=\"company\" value=\"{escape(values.get('company', ''))}\"></label>"
+            f"<label>Job Title<br><input type=\"text\" name=\"title\" value=\"{escape(values.get('title', ''))}\" required></label>"
+            "</div>"
+            "<div class=\"split\">"
+            f"<label>Location<br><input type=\"text\" name=\"location\" value=\"{escape(values.get('location', ''))}\"></label>"
+            f"<label>Job URL<br><input type=\"url\" name=\"url\" value=\"{escape(values.get('url', ''))}\" placeholder=\"https://...\"></label>"
+            "</div>"
+            f"<label>Job Description<br><textarea name=\"description\" required>{escape(values.get('description', ''))}</textarea></label>"
+            "<div class=\"actions\"><button type=\"submit\">Score and Save Job</button></div>"
+            "</form>"
+            "</div>"
+        )
+        start_response("200 OK", _html_headers())
+        return [_layout("Paste JD", body)]
+
+    def _settings_page(start_response):
+        flags = _flags()
+        items = []
+        for name, enabled in flags.items():
+            checked = " checked" if enabled else ""
+            label = name.replace("_", " ").title()
+            items.append(
+                f"<label><input type=\"checkbox\" name=\"{escape(name)}\" value=\"1\"{checked}> {escape(label)}</label>"
+            )
+        body = (
+            "<div class=\"card\">"
+            "<h1>Feature Switchboard</h1>"
+            "<p class=\"muted\">This is the single toggle panel for the useful features you asked for. Scanner modes stay intact; these switches decide which layers stay active.</p>"
+            "<form method=\"post\" action=\"/settings\">"
+            "<div class=\"split\">"
+            f"{''.join(f'<div>{item}</div>' for item in items)}"
+            "</div>"
+            "<div class=\"actions\"><button type=\"submit\">Save Feature Settings</button></div>"
+            "</form>"
+            "</div>"
+        )
+        start_response("200 OK", _html_headers())
+        return [_layout("Feature Switchboard", body)]
+
+    def _boards_page(start_response, query: dict[str, list[str]]):
+        status = ((query.get("status") or ["all"])[-1] or "all").strip().lower()
+        platform = ((query.get("platform") or ["all"])[-1] or "all").strip().lower()
+        stats = db.get_board_stats()
+        boards = db.list_boards(
+            limit=2000,
+            status="" if status == "all" else status,
+            platform="" if platform == "all" else platform,
+        )
+        all_boards = db.list_boards(limit=5000)
+        platforms = sorted({(board.get("platform") or "").strip().lower() for board in all_boards if (board.get("platform") or "").strip()})
+        platform_counts: dict[str, int] = {}
+        for board in all_boards:
+            name = (board.get("platform") or "").strip().lower()
+            if not name:
+                continue
+            platform_counts[name] = platform_counts.get(name, 0) + 1
+        rows = []
+        for board in boards:
+            url = escape(board.get("url") or "")
+            rows.append(
+                "<tr>"
+                f"<td>{escape(board.get('platform') or '')}</td>"
+                f"<td>{escape(board.get('company') or '')}</td>"
+                f"<td>{escape(board.get('status') or '')}</td>"
+                f"<td>{int(board.get('job_count') or 0)}</td>"
+                f"<td>{escape(board.get('last_checked') or '')}</td>"
+                f"<td>{int(board.get('fail_count') or 0)}</td>"
+                f"<td>{escape(board.get('fail_reason') or '')}</td>"
+                f"<td><a href=\"{url}\" target=\"_blank\" rel=\"noreferrer\">Open board</a></td>"
+                "</tr>"
+            )
+        rows_html = "".join(rows) if rows else "<tr><td colspan=\"8\">No boards match the current filters.</td></tr>"
+        status_options = "".join(
+            f"<option value=\"{name}\"{' selected' if status == name else ''}>{label}</option>"
+            for name, label in (("all", "All statuses"), ("active", "Active"), ("degraded", "Degraded"), ("dead", "Dead"))
+        )
+        platform_options = "".join(
+            f"<option value=\"{escape(name)}\"{' selected' if platform == name else ''}>{escape(name.title())}</option>"
+            for name in ["all", *platforms]
+        )
+        platform_pills = "".join(
+            f"<span class=\"pill\">{escape(name.title())}: {count}</span>"
+            for name, count in sorted(platform_counts.items())
+        ) or "<span class=\"muted\">No boards recorded yet.</span>"
+        body = (
+            "<div class=\"card\">"
+            "<h1>Board Health</h1>"
+            "<p class=\"muted\">Track which ATS boards are healthy, which ones are degrading, and which ones are effectively dead before they waste scan time.</p>"
+            "<div class=\"stats\">"
+            f"<div class=\"stat\"><strong>{stats['total']}</strong><span>Total boards</span></div>"
+            f"<div class=\"stat\"><strong>{stats['active']}</strong><span>Active</span></div>"
+            f"<div class=\"stat\"><strong>{stats['degraded']}</strong><span>Degraded</span></div>"
+            f"<div class=\"stat\"><strong>{stats['dead']}</strong><span>Dead</span></div>"
+            "</div>"
+            f"<div>{platform_pills}</div>"
+            "<form method=\"get\" action=\"/boards\" class=\"actions\" data-autosubmit=\"true\">"
+            f"<label>Status<br><select name=\"status\">{status_options}</select></label>"
+            f"<label>Platform<br><select name=\"platform\">{platform_options}</select></label>"
+            "<button type=\"submit\">Apply Filters</button>"
+            "</form>"
+            "</div>"
+            "<div class=\"card\">"
+            "<div class=\"table-wrap\">"
+            "<table><thead><tr><th>Platform</th><th>Company</th><th>Status</th><th>Jobs</th><th>Last Checked</th><th>Failures</th><th>Reason</th><th>URL</th></tr></thead>"
+            f"<tbody>{rows_html}</tbody></table>"
+            "</div>"
+            "</div>"
+        )
+        start_response("200 OK", _html_headers())
+        return [_layout("Board Health", body)]
+
+    def _health_page(start_response, query: dict[str, list[str]]):
+        entity_type = ((query.get("type") or ["all"])[-1] or "all").strip().lower()
+        mode = ((query.get("mode") or ["all"])[-1] or "all").strip().lower()
+        status = ((query.get("status") or ["all"])[-1] or "all").strip().lower()
+        health_rows = db.get_source_health(
+            entity_type="" if entity_type == "all" else entity_type,
+            mode="" if mode == "all" else mode,
+            status="" if status == "all" else status,
+            limit=1000,
+        )
+        run_rows = db.list_source_runs(
+            limit=150,
+            entity_type="" if entity_type == "all" else entity_type,
+            mode="" if mode == "all" else mode,
+            status="" if status in {"all", "healthy", "degraded", "broken"} else status,
+        )
+        summary = db.get_health_summary()
+        type_options = "".join(
+            f"<option value=\"{name}\"{' selected' if entity_type == name else ''}>{label}</option>"
+            for name, label in (("all", "All"), ("main", "Main Sources"), ("board", "Boards"))
+        )
+        mode_options = "".join(
+            f"<option value=\"{name}\"{' selected' if mode == name else ''}>{label}</option>"
+            for name, label in (("all", "All modes"), ("main", "Main"), ("boards", "Boards"))
+        )
+        status_options = "".join(
+            f"<option value=\"{name}\"{' selected' if status == name else ''}>{label}</option>"
+            for name, label in (
+                ("all", "All states"),
+                ("healthy", "Healthy"),
+                ("degraded", "Degraded"),
+                ("broken", "Broken"),
+                ("success", "Last run success"),
+                ("empty", "Last run empty"),
+                ("error", "Last run error"),
+            )
+        )
+        health_table = []
+        for row in health_rows:
+            health_table.append(
+                "<tr>"
+                f"<td>{escape(row['source_key'])}</td>"
+                f"<td>{escape(row['entity_type'])}</td>"
+                f"<td>{escape(row.get('platform') or '')}</td>"
+                f"<td>{escape(row.get('company') or '')}</td>"
+                f"<td>{escape(row['health'])}</td>"
+                f"<td>{escape(row['latest_status'])}</td>"
+                f"<td>{row['latest_fetched_count']}</td>"
+                f"<td>{row['latest_matched_count']}</td>"
+                f"<td>{row['latest_new_count']}</td>"
+                f"<td>{int(round(row['latest_jd_coverage']))}%</td>"
+                f"<td>{row['failure_streak']}</td>"
+                f"<td>{escape(row.get('last_success_at') or '')}</td>"
+                f"<td>{escape(row.get('last_error') or '')}</td>"
+                "</tr>"
+            )
+        health_rows_html = "".join(health_table) if health_table else "<tr><td colspan=\"13\">No health rows match the current filters.</td></tr>"
+        run_table = []
+        for row in run_rows:
+            run_table.append(
+                "<tr>"
+                f"<td>{escape(row['finished_at'])}</td>"
+                f"<td>{escape(row['source_key'])}</td>"
+                f"<td>{escape(row['entity_type'])}</td>"
+                f"<td>{escape(row['status'])}</td>"
+                f"<td>{int(row['fetched_count'])}</td>"
+                f"<td>{int(row['matched_count'])}</td>"
+                f"<td>{int(row['new_count'])}</td>"
+                f"<td>{int(row['latency_ms'])}</td>"
+                f"<td>{int(round(float(row['jd_coverage'] or 0.0)))}%</td>"
+                f"<td>{escape(row.get('error_text') or '')}</td>"
+                "</tr>"
+            )
+        run_rows_html = "".join(run_table) if run_table else "<tr><td colspan=\"10\">No run history yet.</td></tr>"
+        body = (
+            "<div class=\"card\">"
+            "<h1>Source Health</h1>"
+            "<p class=\"muted\">Track both main sources and board runs to spot quality regressions, empty returns, and failing adapters quickly.</p>"
+            "<div class=\"stats\">"
+            f"<div class=\"stat\"><strong>{summary['total']}</strong><span>Total tracked</span></div>"
+            f"<div class=\"stat\"><strong>{summary['healthy']}</strong><span>Healthy</span></div>"
+            f"<div class=\"stat\"><strong>{summary['degraded']}</strong><span>Degraded</span></div>"
+            f"<div class=\"stat\"><strong>{summary['broken']}</strong><span>Broken</span></div>"
+            "</div>"
+            f"<p class=\"muted\">Recent failures in the last 24 hours: <strong>{summary['failures_24h']}</strong></p>"
+            "<form method=\"get\" action=\"/health\" class=\"actions\" data-autosubmit=\"true\">"
+            f"<label>Type<br><select name=\"type\">{type_options}</select></label>"
+            f"<label>Mode<br><select name=\"mode\">{mode_options}</select></label>"
+            f"<label>Status<br><select name=\"status\">{status_options}</select></label>"
+            "<button type=\"submit\">Apply Filters</button>"
+            "</form>"
+            "</div>"
+            "<div class=\"card\">"
+            "<h2>Latest Health By Source</h2>"
+            "<div class=\"table-wrap\">"
+            "<table><thead><tr><th>Key</th><th>Type</th><th>Platform</th><th>Company</th><th>Health</th><th>Last Status</th><th>Fetched</th><th>Matched</th><th>New</th><th>JD</th><th>Streak</th><th>Last Success</th><th>Last Error</th></tr></thead>"
+            f"<tbody>{health_rows_html}</tbody></table>"
+            "</div>"
+            "</div>"
+            "<div class=\"card\">"
+            "<h2>Recent Run History</h2>"
+            "<div class=\"table-wrap\">"
+            "<table><thead><tr><th>Finished</th><th>Key</th><th>Type</th><th>Status</th><th>Fetched</th><th>Matched</th><th>New</th><th>Latency ms</th><th>JD</th><th>Error</th></tr></thead>"
+            f"<tbody>{run_rows_html}</tbody></table>"
+            "</div>"
+            "</div>"
+        )
+        start_response("200 OK", _html_headers())
+        return [_layout("Health", body)]
+
+    def _resume_page(start_response, resume_id: int):
+        resume = db.get_generated_resume(resume_id)
+        if resume is None:
+            start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+            return [b"Resume packet not found."]
+        if (resume.get("format") or "").strip().lower() == "prompt_packet":
+            return _redirect(start_response, f"/packet?id={resume_id}")
+        body = (
+            "<div class=\"card\">"
+            f"<h1>Resume Packet #{resume['id']}</h1>"
+            f"<p class=\"muted\">{escape(resume['job_title'])} | {escape(resume['company'])} | {escape(resume['created_at'])}</p>"
+            f"<pre>{escape(resume['content'])}</pre>"
+            "</div>"
+        )
+        start_response("200 OK", _html_headers())
+        return [_layout("Resume Packet", body)]
+
+    def _packet_page(start_response, resume_id: int):
+        resume = db.get_generated_resume(resume_id)
+        if resume is None:
+            start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+            return [b"Prompt packet not found."]
+        artifacts = db.list_generated_artifacts(resume_id)
+        artifact_cards: list[str] = []
+        for artifact in artifacts:
+            artifact_id = int(artifact["id"])
+            pre_id = f"artifact-{artifact_id}"
+            artifact_cards.append(
+                "<div class=\"card\">"
+                f"<h2>{escape(artifact.get('name') or 'Artifact')}</h2>"
+                f"<div class=\"artifact-meta\"><span class=\"pill\">{escape(artifact.get('filename') or '')}</span><span class=\"pill\">{escape((artifact.get('format') or 'text').upper())}</span></div>"
+                "<div class=\"artifact-actions\">"
+                f"<button type=\"button\" onclick=\"copyText('{pre_id}')\">Copy</button>"
+                f"<a class=\"button-link\" href=\"/artifact?id={artifact_id}\">Download</a>"
+                "</div>"
+                f"<pre id=\"{pre_id}\">{escape(artifact.get('content') or '')}</pre>"
+                "</div>"
+            )
+        if not artifact_cards:
+            artifact_cards.append(
+                "<div class=\"card\"><p class=\"muted\">No separate artifacts were saved for this packet.</p>"
+                f"<pre>{escape(resume.get('content') or '')}</pre></div>"
+            )
+        bundle_pre_id = f"packet-bundle-{resume_id}"
+        body = (
+            "<div class=\"card\">"
+            f"<h1>Prompt Packet #{resume['id']}</h1>"
+            f"<p class=\"muted\">{escape(resume['job_title'])} | {escape(resume['company'])} | {escape(resume['created_at'])}</p>"
+            "<p class=\"muted\">Use the separate files below for prompt, JD markdown, generated resume TeX, and cover letter.</p>"
+            "<div class=\"artifact-actions\">"
+            f"<button type=\"button\" onclick=\"copyText('{bundle_pre_id}')\">Copy Full Packet</button>"
+            "</div>"
+            f"<pre id=\"{bundle_pre_id}\">{escape(resume['content'])}</pre>"
+            "</div>"
+            + "".join(artifact_cards)
+        )
+        start_response("200 OK", _html_headers())
+        return [_layout("Prompt Packet", body)]
+
+    def _artifact_download(start_response, artifact_id: int):
+        artifact = db.get_generated_artifact(artifact_id)
+        if artifact is None:
+            start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+            return [b"Artifact not found."]
+        filename = (artifact.get("filename") or f"artifact-{artifact_id}.txt").replace("\"", "")
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", _artifact_content_type(str(artifact.get("format") or ""))),
+                ("Content-Disposition", f'attachment; filename="{filename}"'),
+                ("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0"),
+            ],
+        )
+        return [str(artifact.get("content") or "").encode("utf-8")]
+
+    def app(environ, start_response):
+        path = environ.get("PATH_INFO", "/") or "/"
+        method = environ.get("REQUEST_METHOD", "GET").upper()
+        query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+
+        def _redirect_home(form: dict[str, str | list[str]] | None = None, *, message: str = ""):
+            form = form or {}
+            days = form.get("days", str(RECENT_JOB_DAYS))
+            queue = form.get("queue", "active")
+            source = form.get("source", "all")
+            status = form.get("status", "all")
+            sort_by = form.get("sort", "newest")
+            rescore_limit = form.get("rescore_limit", "500")
+            query = (
+                f"/?days={quote(str(days), safe='')}"
+                f"&queue={quote(str(queue), safe='')}"
+                f"&source={quote(str(source), safe='')}"
+                f"&status={quote(str(status), safe='')}"
+                f"&sort={quote(str(sort_by), safe='')}"
+                f"&rescore_limit={quote(str(rescore_limit), safe='')}"
+            )
+            if message:
+                query += f"&message={quote(message, safe='')}"
+            return _redirect(
+                start_response,
+                query,
+            )
+
+        if path == "/" and method == "GET":
+            return _jobs_page(start_response, query)
+
+        if path == "/job" and method == "GET":
+            key = (query.get("key") or [""])[-1]
+            return _job_page(start_response, key)
+
+        if path == "/jobs/re-evaluate" and method == "POST":
+            form = _read_post(environ)
+            try:
+                rescore_limit = max(int(form.get("rescore_limit", "500") or "500"), 1)
+            except ValueError:
+                rescore_limit = 500
+            jobs = _filtered_jobs_snapshot(form, limit=rescore_limit)
+            processed = _batch_refresh(jobs)
+            return _redirect_home(form, message=f"Re-scored {processed} job(s) from the current filtered view.")
+
+        if path == "/scan" and method == "POST":
+            form = _read_post(environ)
+            mode = (form.get("scan_mode", "all") or "all").strip().lower()
+            if mode not in {"main", "boards", "all"}:
+                mode = "all"
+            started = _start_scan(mode)
+            if not started:
+                current = _scan_snapshot()
+                _set_scan_state(
+                    message=f"A scan is already running ({current.get('mode') or 'unknown'}). Wait for it to finish before starting another one."
+                )
+            return _redirect_home(form)
+
+        if path == "/jobs/bulk-update" and method == "POST":
+            try:
+                size = int(environ.get("CONTENT_LENGTH") or "0")
+            except ValueError:
+                size = 0
+            raw = environ["wsgi.input"].read(size).decode("utf-8") if size > 0 else ""
+            parsed = parse_qs(raw, keep_blank_values=True)
+            keys = parsed.get("job_key") or []
+            bulk_status = ((parsed.get("bulk_status") or ["new"])[-1] or "new").strip()
+            for key in keys:
+                db.update_pipeline(key=key, pipeline_status=bulk_status)
+            return _redirect_home(
+                {
+                    "days": (parsed.get("days") or [str(RECENT_JOB_DAYS)])[-1],
+                    "queue": (parsed.get("queue") or ["active"])[-1],
+                    "source": (parsed.get("source") or ["all"])[-1],
+                    "status": (parsed.get("status") or ["all"])[-1],
+                    "sort": (parsed.get("sort") or ["newest"])[-1],
+                    "rescore_limit": (parsed.get("rescore_limit") or ["500"])[-1],
+                }
+            )
+
+        if path == "/job/generate-resume" and method == "POST":
+            form = _read_post(environ)
+            key = form.get("key", "")
+            job = db.get_job(key)
+            if job is None:
+                start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+                return [b"Job not found."]
+            flags = _flags()
+            if not flags.get("resume_generation", True):
+                return _redirect(start_response, f"/job?key={quote(key, safe='')}")
+            evaluation = evaluate_job(
+                job["title"],
+                job.get("description", ""),
+                company=job["company"],
+                location=job["location"],
+                source=job.get("source", ""),
+                require_us_location=cfg.filter.require_us_location,
+            )
+            packet = generate_resume_packet(job, evaluation)
+            resume_id = db.save_generated_resume(
+                job_key=job["key"],
+                job_title=job["title"],
+                company=job["company"],
+                content=str(packet["bundle_markdown"]),
+                format="prompt_packet",
+            )
+            for artifact in packet.get("artifacts", []):
+                if not isinstance(artifact, dict):
+                    continue
+                db.save_generated_artifact(
+                    resume_id=resume_id,
+                    name=str(artifact.get("name") or "Artifact"),
+                    filename=str(artifact.get("filename") or ""),
+                    format=str(artifact.get("format") or "text"),
+                    content=str(artifact.get("content") or ""),
+                )
+            return _redirect(start_response, f"/packet?id={resume_id}")
+
+        if path == "/job/pipeline" and method == "POST":
+            form = _read_post(environ)
+            key = form.get("key", "")
+            db.update_pipeline(
+                key=key,
+                pipeline_status=form.get("pipeline_status", "new").strip() or "new",
+                pipeline_notes=form.get("pipeline_notes", "").strip(),
+                follow_up_date=form.get("follow_up_date", "").strip(),
+            )
+            return _redirect(start_response, f"/job?key={quote(key, safe='')}")
+
+        if path == "/manual-jd" and method == "GET":
+            return _manual_page(start_response)
+
+        if path == "/manual-jd" and method == "POST":
+            form = _read_post(environ)
+            title = form.get("title", "").strip()
+            description = form.get("description", "").strip()
+            if not title or not description:
+                return _manual_page(start_response, form, "Job title and description are required.")
+            company = form.get("company", "").strip() or "Manual Entry"
+            location = form.get("location", "").strip() or "Unknown Location"
+            url = form.get("url", "").strip() or f"manual://{_slug(company)}"
+            evaluation = evaluate_job(
+                title,
+                description,
+                company=company,
+                location=location,
+                source="manual",
+                require_us_location=cfg.filter.require_us_location,
+            )
+            digest = hashlib.sha1(f"{company.lower()}|{title.lower()}|{description[:240]}".encode("utf-8")).hexdigest()[:12]
+            manual_key = f"manual:{_slug(company)}:{_slug(title)}:{digest}"
+            db.create_manual_job(
+                key=manual_key,
+                company=company,
+                title=title,
+                location=location,
+                url=url,
+                description=description,
+                score=evaluation.score,
+                label=evaluation.label,
+                grade=evaluation.grade,
+                evaluation_json=evaluation.to_json(),
+                fit_summary=evaluation.fit_summary,
+            )
+            return _redirect(start_response, f"/job?key={quote(manual_key, safe='')}")
+
+        if path == "/settings" and method == "GET":
+            return _settings_page(start_response)
+
+        if path == "/boards" and method == "GET":
+            return _boards_page(start_response, query)
+
+        if path == "/health" and method == "GET":
+            return _health_page(start_response, query)
+
+        if path == "/settings" and method == "POST":
+            form = _read_post(environ)
+            for name in defaults:
+                db.set_feature_flag(name, form.get(name) == "1")
+            return _redirect(start_response, "/settings")
+
+        if path == "/resume" and method == "GET":
+            raw_id = (query.get("id") or ["0"])[-1]
+            try:
+                resume_id = int(raw_id)
+            except ValueError:
+                resume_id = 0
+            return _resume_page(start_response, resume_id)
+
+        if path == "/packet" and method == "GET":
+            raw_id = (query.get("id") or ["0"])[-1]
+            try:
+                resume_id = int(raw_id)
+            except ValueError:
+                resume_id = 0
+            return _packet_page(start_response, resume_id)
+
+        if path == "/artifact" and method == "GET":
+            raw_id = (query.get("id") or ["0"])[-1]
+            try:
+                artifact_id = int(raw_id)
+            except ValueError:
+                artifact_id = 0
+            return _artifact_download(start_response, artifact_id)
+
+        start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+        return [b"Not found."]
+
+    with make_server(host, port, app) as httpd:
+        print(f"Job Radar web UI running at http://{host}:{port}")
+        httpd.serve_forever()

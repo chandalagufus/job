@@ -1,0 +1,202 @@
+"""Candidate profile template with optional local overrides.
+
+Tracked file stays generic. Personal local data should live in
+``src/profile_local.py`` which is gitignored.
+"""
+from __future__ import annotations
+
+PROFILE = {
+    "name": "candidate name",
+    "email": "candidate@example.com",
+    "location": "Candidate City, ST",
+    "preferred_locations": [
+        "Candidate City, ST",
+        "Metro Area A",
+        "Metro Area B",
+        "State A",
+        "State B",
+    ],
+    "location_addresses": {
+        "Candidate City, ST": "Candidate City, ST",
+        "Metro Area A": "Metro Area A",
+        "Metro Area B": "Metro Area B",
+        "State A": "State A",
+        "State B": "State B",
+    },
+    "experience_years": 3,
+    "education": "Candidate Degree / Program",
+    "target_roles": [
+        "Data Scientist",
+        "Data Engineer",
+        "Data Analyst",
+        "Analytics Engineer",
+        "Machine Learning Engineer",
+        "Machine Learning Scientist",
+        "MLOps Engineer",
+        "Applied Scientist",
+        "AI Engineer",
+        "Decision Scientist",
+        "Research Scientist",
+        "Business Intelligence Analyst",
+        "Business Intelligence Engineer",
+        "Business Intelligence Developer",
+        "Data Warehouse Engineer",
+        "ML/AI Data Engineer",
+        "Product Analyst",
+        "Business Analyst",
+        "Insights Analyst",
+        "Insights Engineer",
+        "Reporting Analyst",
+        "Product Analytics Engineer",
+        "Forecasting Analyst",
+        "Experimentation Analyst",
+        "Data Platform Engineer",
+        "LLM Engineer",
+        "Prompt Engineer",
+    ],
+}
+
+SKILLS_STRONG: set[str] = {
+    "airflow",
+    "apache spark",
+    "attention mechanisms",
+    "automated retraining",
+    "aws",
+    "azure",
+    "bash",
+    "beautifulsoup",
+    "bigquery",
+    "chroma",
+    "chromadb",
+    "ci/cd",
+    "codex",
+    "cursor",
+    "data modeling",
+    "data warehouse",
+    "databricks",
+    "dbt",
+    "docker",
+    "drift detection",
+    "duckdb",
+    "elt",
+    "etl",
+    "faiss",
+    "fastapi",
+    "git",
+    "github",
+    "github actions",
+    "gcp",
+    "glue",
+    "google analytics",
+    "hadoop",
+    "hugging face",
+    "hugging face transformers",
+    "java",
+    "kafka",
+    "kinesis",
+    "kubernetes",
+    "lambda",
+    "lightgbm",
+    "linux",
+    "llm evaluation",
+    "llm fine-tuning",
+    "lstm",
+    "machine learning",
+    "matplotlib",
+    "mcp",
+    "ml",
+    "mlflow",
+    "model monitoring",
+    "mongodb",
+    "monte carlo",
+    "mysql",
+    "nltk",
+    "numpy",
+    "openai api",
+    "pipeline",
+    "postgres",
+    "postgresql",
+    "power bi",
+    "prompt engineering",
+    "pyspark",
+    "python",
+    "pytorch",
+    "quicksight",
+    "rag",
+    "redshift",
+    "rest api",
+    "r",
+    "s3",
+    "sagemaker",
+    "scikit-learn",
+    "sklearn",
+    "shap",
+    "snowflake",
+    "spark",
+    "sql",
+    "sql server",
+    "streamlit",
+    "tableau",
+    "tensorflow",
+    "transfer learning",
+    "transformer",
+    "transformer architectures",
+    "xgboost",
+}
+
+SKILLS_MODERATE: set[str] = {
+    "alteryx",
+    "chain-of-thought prompting",
+    "excel",
+    "google cloud",
+    "hive",
+    "hql",
+    "looker",
+}
+
+try:
+    from .profile_local import PROFILE as LOCAL_PROFILE
+    from .profile_local import SKILLS_MODERATE as LOCAL_SKILLS_MODERATE
+    from .profile_local import SKILLS_STRONG as LOCAL_SKILLS_STRONG
+except ImportError:
+    LOCAL_PROFILE = None
+    LOCAL_SKILLS_STRONG = None
+    LOCAL_SKILLS_MODERATE = None
+
+if isinstance(LOCAL_PROFILE, dict):
+    PROFILE = LOCAL_PROFILE
+if isinstance(LOCAL_SKILLS_STRONG, set):
+    SKILLS_STRONG = LOCAL_SKILLS_STRONG
+if isinstance(LOCAL_SKILLS_MODERATE, set):
+    SKILLS_MODERATE = LOCAL_SKILLS_MODERATE
+
+_STRONG_BONUS = 8
+_MODERATE_BONUS = 3
+
+
+def skill_bonus(text: str, cap: int = 20) -> int:
+    """Return a skill-match bonus (0-cap) based on skills found in ``text``."""
+    t = (text or "").lower()
+    bonus = 0
+    for skill in SKILLS_STRONG:
+        if skill in t:
+            bonus += _STRONG_BONUS
+    for skill in SKILLS_MODERATE:
+        if skill in t:
+            bonus += _MODERATE_BONUS
+    return min(bonus, cap)
+
+
+def profile_summary_html() -> str:
+    return (
+        f"<p style='font-size:12px;color:#666;margin:0 0 8px'>"
+        f"Matched for <strong>{PROFILE['name']}</strong> - "
+        f"targeting <em>{', '.join(PROFILE['target_roles'][:4])}...</em></p>"
+    )
+
+
+def profile_summary_text() -> str:
+    return (
+        f"Profile: {PROFILE['name']} | "
+        f"Target: {', '.join(PROFILE['target_roles'][:3])}..."
+    )

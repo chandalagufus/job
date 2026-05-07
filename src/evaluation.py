@@ -1,0 +1,651 @@
+"""Structured job-fit evaluation with weighted dimensions and letter grades."""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from functools import lru_cache
+import json
+from pathlib import Path
+import re
+
+from .classifier import (
+    CLEARANCE_EXCLUDE_PHRASES,
+    CLEARANCE_EXCLUDE_REGEXES,
+    HARD_EXCLUDE_REGEXES,
+    SENIORITY_TOKENS,
+    VERY_SENIOR,
+    classify,
+)
+from .config import Config
+from .profile import PROFILE, SKILLS_MODERATE, SKILLS_STRONG
+from .sources.base import is_us_location
+
+EVAL_CFG = Config.load()
+ROOT_DIR = Path(__file__).resolve().parents[1]
+LOCAL_BASE_RESUME_PATH = ROOT_DIR / "data" / "resume" / "base_resume.local.md"
+BASE_RESUME_PATH = ROOT_DIR / "data" / "resume" / "base_resume.md"
+STRONG_DIRECT_SOURCES = frozenset({
+    "amazon",
+    "apple",
+    "google",
+    "goldman_sachs",
+    "ibm",
+    "linkedin",
+    "meta",
+    "microsoft",
+    "netflix",
+    "nvidia",
+    "oracle",
+    "stripe",
+})
+CRITICAL_SKILL_HINTS = (
+    " years ",
+    "experience with",
+    "experience in",
+    "expertise",
+    "proficiency",
+    "strong ",
+    "deep experience",
+    "hands-on",
+    "required",
+    "must",
+    "need ",
+    "needs ",
+)
+SKILL_EVIDENCE_ALIASES: dict[str, tuple[str, ...]] = {
+    "apache spark": ("apache spark", "spark", "pyspark"),
+    "ci/cd": ("ci/cd", "ci cd", "github actions"),
+    "elt": ("elt", "etl", "data pipeline", "data pipelines", "pipeline workflow", "pipeline workflows"),
+    "etl": ("etl", "elt", "data pipeline", "data pipelines", "pipeline workflow", "pipeline workflows"),
+    "hugging face transformers": ("hugging face transformers", "hugging face", "transformers"),
+    "machine learning": ("machine learning", "ml"),
+    "ml": ("ml", "machine learning"),
+    "pipeline": ("pipeline", "pipelines", "workflow", "workflows"),
+    "pyspark": ("pyspark", "spark", "apache spark"),
+    "rest api": ("rest api", "rest apis", "api", "apis"),
+    "spark": ("spark", "pyspark", "apache spark"),
+}
+
+
+@dataclass
+class EvaluationDimension:
+    name: str
+    weight: float
+    score: int
+    reason: str
+
+    @property
+    def weighted_points(self) -> float:
+        return (self.score / 100.0) * self.weight * 100.0
+
+
+@dataclass
+class EvaluationResult:
+    score: int
+    label: str
+    grade: str
+    matched_strong: list[str]
+    matched_moderate: list[str]
+    unsupported_strong: list[str]
+    unsupported_moderate: list[str]
+    critical_skill_gaps: list[str]
+    reasons: list[str]
+    fit_summary: str
+    dimensions: list[EvaluationDimension]
+
+    def to_dict(self) -> dict:
+        return {
+            "score": self.score,
+            "label": self.label,
+            "grade": self.grade,
+            "matched_strong": list(self.matched_strong),
+            "matched_moderate": list(self.matched_moderate),
+            "unsupported_strong": list(self.unsupported_strong),
+            "unsupported_moderate": list(self.unsupported_moderate),
+            "critical_skill_gaps": list(self.critical_skill_gaps),
+            "reasons": list(self.reasons),
+            "fit_summary": self.fit_summary,
+            "dimensions": [asdict(d) | {"weighted_points": round(d.weighted_points, 2)} for d in self.dimensions],
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=True, sort_keys=True)
+
+
+def _norm(*parts: str) -> str:
+    return "\n".join((p or "").strip().lower() for p in parts if p).strip()
+
+
+def _phrase_match(text: str, phrase: str) -> bool:
+    normalized_text = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    normalized_phrase = re.sub(r"[^a-z0-9]+", " ", phrase.lower()).strip()
+    if not normalized_text or not normalized_phrase:
+        return False
+    if len(normalized_phrase) == 1:
+        return False
+    return re.search(rf"\b{re.escape(normalized_phrase)}\b", normalized_text) is not None
+
+
+@lru_cache(maxsize=1)
+def _resume_evidence_text() -> str:
+    for path in (LOCAL_BASE_RESUME_PATH, BASE_RESUME_PATH):
+        try:
+            markdown = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        sections: list[str] = []
+        current = ""
+        for line in markdown.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                current = stripped[3:].strip().lower()
+                continue
+            if current in {"professional experience", "selected projects"} and stripped:
+                sections.append(stripped)
+        if sections:
+            return _norm("\n".join(sections))
+    return ""
+
+
+def _skill_aliases(skill: str) -> tuple[str, ...]:
+    aliases = SKILL_EVIDENCE_ALIASES.get(skill, ())
+    if skill not in aliases:
+        return (skill,) + aliases
+    return aliases
+
+
+def _has_resume_evidence(skill: str, evidence_text: str) -> bool:
+    if not evidence_text:
+        return False
+    return any(_phrase_match(evidence_text, alias) for alias in _skill_aliases(skill))
+
+
+def _is_critical_skill_requirement(skill: str, description: str) -> bool:
+    raw_text = f" {re.sub(r'[^a-z0-9]+', ' ', (description or '').lower())} "
+    if not any(_phrase_match(raw_text, alias) for alias in _skill_aliases(skill)):
+        return False
+    for sentence in re.split(r"[.\n]+", raw_text):
+        if not sentence.strip():
+            continue
+        if not any(_phrase_match(sentence, alias) for alias in _skill_aliases(skill)):
+            continue
+        if any(hint in sentence for hint in CRITICAL_SKILL_HINTS):
+            return True
+    return False
+
+
+@dataclass
+class SkillEvidenceAssessment:
+    supported_strong: list[str]
+    supported_moderate: list[str]
+    unsupported_strong: list[str]
+    unsupported_moderate: list[str]
+    critical_skill_gaps: list[str]
+    supported_strong_points: int
+    supported_moderate_points: int
+
+
+def _assess_skill_evidence(
+    title: str,
+    description: str,
+    matched_strong: list[str],
+    matched_moderate: list[str],
+) -> SkillEvidenceAssessment:
+    evidence_text = _resume_evidence_text()
+    title_text = _norm(title)
+    supported_strong: list[str] = []
+    supported_moderate: list[str] = []
+    unsupported_strong: list[str] = []
+    unsupported_moderate: list[str] = []
+    critical_skill_gaps: list[str] = []
+    supported_strong_points = 0
+    supported_moderate_points = 0
+
+    for skill in matched_strong:
+        if _has_resume_evidence(skill, evidence_text):
+            supported_strong.append(skill)
+            supported_strong_points += 18 if _phrase_match(title_text, skill) else 12
+        else:
+            unsupported_strong.append(skill)
+            if _is_critical_skill_requirement(skill, description):
+                critical_skill_gaps.append(skill)
+
+    for skill in matched_moderate:
+        if _has_resume_evidence(skill, evidence_text):
+            supported_moderate.append(skill)
+            supported_moderate_points += 8 if _phrase_match(title_text, skill) else 5
+        else:
+            unsupported_moderate.append(skill)
+            if _is_critical_skill_requirement(skill, description):
+                critical_skill_gaps.append(skill)
+
+    return SkillEvidenceAssessment(
+        supported_strong=supported_strong,
+        supported_moderate=supported_moderate,
+        unsupported_strong=unsupported_strong,
+        unsupported_moderate=unsupported_moderate,
+        critical_skill_gaps=critical_skill_gaps,
+        supported_strong_points=supported_strong_points,
+        supported_moderate_points=supported_moderate_points,
+    )
+
+
+def _match_skills(title: str, description: str) -> tuple[list[str], list[str], int, int]:
+    title_text = _norm(title)
+    description_text = _norm(description)
+    matched_strong: list[str] = []
+    matched_moderate: list[str] = []
+    strong_points = 0
+    moderate_points = 0
+
+    for skill in sorted(SKILLS_STRONG):
+        in_title = _phrase_match(title_text, skill)
+        in_desc = _phrase_match(description_text, skill)
+        if in_title or in_desc:
+            matched_strong.append(skill)
+            strong_points += 18 if in_title else 12
+
+    for skill in sorted(SKILLS_MODERATE):
+        in_title = _phrase_match(title_text, skill)
+        in_desc = _phrase_match(description_text, skill)
+        if in_title or in_desc:
+            matched_moderate.append(skill)
+            moderate_points += 8 if in_title else 5
+
+    return matched_strong, matched_moderate, strong_points, moderate_points
+
+
+def _target_role_hits(text: str) -> list[str]:
+    hits: list[str] = []
+    for role in PROFILE.get("target_roles", []):
+        if role.lower() in text:
+            hits.append(role)
+    return hits
+
+
+def _score_to_label(score: int) -> str:
+    if score >= 70:
+        return "yes"
+    if score >= 40:
+        return "maybe"
+    return "no"
+
+
+def _score_to_grade(score: int) -> str:
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 55:
+        return "D"
+    if score >= 40:
+        return "E"
+    return "F"
+
+
+def _has_clearance_block(text: str) -> str:
+    for phrase in CLEARANCE_EXCLUDE_PHRASES:
+        if phrase in text:
+            return f"Blocked by clearance/citizenship phrase: {phrase}."
+    for pattern in CLEARANCE_EXCLUDE_REGEXES + HARD_EXCLUDE_REGEXES:
+        if re.search(pattern, text):
+            return "Blocked by hard exclusion in the job title or description."
+    return ""
+
+
+def _find_seniority_token(text: str) -> str:
+    for token in SENIORITY_TOKENS:
+        if re.search(rf"\b{re.escape(token)}\b", text):
+            return token
+    return ""
+
+
+def _title_level_block(title: str) -> str:
+    normalized = (title or "").strip().lower()
+    blocked_titles = (
+        "principal",
+        "senior staff",
+        "staff",
+        "distinguished",
+        "fellow",
+    )
+    for token in blocked_titles:
+        if re.search(rf"\b{re.escape(token)}\b", normalized):
+            return f"Blocked because the title contains {token}, which is above your target level."
+    return ""
+
+
+def _source_is_strong_first_party(source: str) -> bool:
+    return (source or "").strip().lower() in STRONG_DIRECT_SOURCES
+
+
+def _extract_years_requirement(text: str) -> int:
+    matches = re.findall(
+        r"\b(\d{1,2})\+?\s*(?:-|to|–|—)?\s*(\d{1,2})?\s+years?\s+(?:of\s+)?(?:experience|exp)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not matches:
+        return 0
+    mins: list[int] = []
+    for low, _high in matches:
+        try:
+            mins.append(int(low))
+        except ValueError:
+            continue
+    return max(mins) if mins else 0
+
+
+def _dimension_title_fit(title: str) -> tuple[int, str]:
+    title_result = classify(title)
+    if title_result.label == "yes":
+        return 92, "The title is strongly aligned with your target roles."
+    if title_result.label == "maybe":
+        return 65, "The title is adjacent to your target roles but needs review."
+    return 20, "The title is weak or ambiguous for your target role set."
+
+
+def _dimension_skill_overlap(
+    matched_strong: list[str],
+    matched_moderate: list[str],
+    strong_points: int,
+    moderate_points: int,
+    assessment: SkillEvidenceAssessment,
+) -> tuple[int, str]:
+    raw_score = min(100, strong_points + moderate_points)
+    supported_score = min(100, assessment.supported_strong_points + assessment.supported_moderate_points)
+    if assessment.critical_skill_gaps:
+        score = max(35, min(raw_score - 28, supported_score + 18))
+        return score, (
+            "Keyword overlap exists, but JD-critical skills are not backed by resume bullets/projects: "
+            f"{', '.join(assessment.critical_skill_gaps[:4])}."
+        )
+    if assessment.unsupported_strong or assessment.unsupported_moderate:
+        score = max(40, min(raw_score - 12, supported_score + 22))
+        unsupported = assessment.unsupported_strong + assessment.unsupported_moderate
+        return score, (
+            "Some overlap is only declared in the skills list and not evidenced in work/projects: "
+            f"{', '.join(unsupported[:4])}."
+        )
+    if matched_strong:
+        return raw_score, f"Direct skill overlap found with supporting evidence: {', '.join(matched_strong[:6])}."
+    if matched_moderate:
+        return max(raw_score, 35), f"Secondary overlap found with supporting evidence: {', '.join(matched_moderate[:6])}."
+    return 18, "The stored title/JD text shows little direct skill overlap."
+
+
+def _dimension_target_alignment(role_hits: list[str]) -> tuple[int, str]:
+    if role_hits:
+        return min(100, 60 + len(role_hits) * 12), f"Target role overlap: {', '.join(role_hits[:4])}."
+    return 30, "The posting does not explicitly mention your preferred role families."
+
+
+def _dimension_seniority(text: str) -> tuple[int, str]:
+    years_required = _extract_years_requirement(text)
+    if years_required > 3:
+        return 5, f"The posting requires {years_required}+ years of experience, which is above your target range."
+    token = _find_seniority_token(text)
+    if not token:
+        return 85, "The role does not appear overly senior from the visible text."
+    if token in VERY_SENIOR:
+        return 10, f"The posting looks far above your target level because it mentions {token}."
+    return 45, f"The posting may be slightly above your target level because it mentions {token}."
+
+
+def _experience_penalty(text: str) -> tuple[int, str]:
+    years_required = _extract_years_requirement(text)
+    if years_required <= 3:
+        return 0, ""
+    return 100, f"Blocked because the role requires {years_required}+ years of experience, above your 0-3 year target range."
+
+
+def _location_block(location: str, text: str, *, require_us_location: bool) -> str:
+    if not require_us_location:
+        return ""
+    loc = (location or "").strip()
+    if not loc or loc.lower() == "unknown location":
+        return ""
+    if is_us_location(loc):
+        return ""
+    if "remote" in text and ("united states" in text or re.search(r"\busa?\b", text)):
+        return ""
+    return f"Blocked because the visible location is outside the US: {location}."
+
+
+def _dimension_location(location: str, text: str) -> tuple[int, str]:
+    loc = (location or "").lower()
+    preferred_locations = [str(item).lower() for item in PROFILE.get("preferred_locations", []) if item]
+    preferred_tokens: set[str] = set()
+    for item in preferred_locations:
+        preferred_tokens.update(part.strip() for part in re.split(r"[,/]", item) if part.strip())
+
+    if "remote" in loc or "united states" in loc or re.search(r"\busa?\b", loc):
+        return 90, "The location appears remote-friendly or clearly US-based."
+    if any(token and token in loc for token in preferred_tokens):
+        return 92, f"The location matches one of your approved markets: {location}."
+    if any(token and token in text for token in preferred_tokens):
+        return 85, "The job text references one of your approved target markets."
+    if location:
+        return 65, f"The visible location is {location}."
+    if "remote" in text:
+        return 80, "The job text suggests remote work."
+    return 40, "Location information is weak or missing."
+
+
+def _dimension_evidence(
+    description: str,
+    matched_strong: list[str],
+    matched_moderate: list[str],
+    assessment: SkillEvidenceAssessment,
+) -> tuple[int, str]:
+    desc = (description or "").strip()
+    if assessment.critical_skill_gaps:
+        return 34, (
+            "The JD is detailed, but important requirements are not verified in experience/project evidence: "
+            f"{', '.join(assessment.critical_skill_gaps[:4])}."
+        )
+    if assessment.unsupported_strong:
+        return 52, (
+            "The JD has overlap, but some strong-skill matches are only declared and not demonstrated: "
+            f"{', '.join(assessment.unsupported_strong[:4])}."
+        )
+    if len(desc) >= 600 and (matched_strong or matched_moderate):
+        return 88, "There is enough JD detail to support a more confident fit assessment."
+    if len(desc) >= 200:
+        return 68, "There is some JD text, but the evidence is still partial."
+    return 32, "The evaluation is based mostly on title and limited metadata."
+
+
+def _evidence_score_cap(description: str, source: str) -> tuple[int, str]:
+    desc = (description or "").strip()
+    if len(desc) >= 120:
+        return 100, ""
+    if _source_is_strong_first_party(source):
+        return 100, ""
+    if desc:
+        return 59, "Capped because the stored JD is too thin to support a high-confidence match."
+    return 45, "Capped because no job description is stored yet for this role."
+
+
+def _resume_gap_score_cap(assessment: SkillEvidenceAssessment) -> tuple[int, str]:
+    if assessment.critical_skill_gaps:
+        return 72, (
+            "Capped because at least one JD-critical skill is not backed by resume experience or project evidence: "
+            f"{', '.join(assessment.critical_skill_gaps[:4])}."
+        )
+    if len(assessment.unsupported_strong) >= 3:
+        return 84, (
+            "Capped because several strong keyword matches are skills-list-only and not supported by bullets/projects."
+        )
+    return 100, ""
+
+
+def _dimension_risk(text: str) -> tuple[int, str]:
+    block = _has_clearance_block(text)
+    if block:
+        return 0, block
+    return 92, "No clearance or citizenship blockers were detected."
+
+
+def evaluate_job(
+    title: str,
+    description: str = "",
+    *,
+    company: str = "",
+    location: str = "",
+    source: str = "",
+    require_us_location: bool | None = None,
+) -> EvaluationResult:
+    if require_us_location is None:
+        require_us_location = EVAL_CFG.filter.require_us_location
+    text = _norm(title, description, company, location)
+    matched_strong, matched_moderate, strong_points, moderate_points = _match_skills(title, description)
+    assessment = _assess_skill_evidence(title, description, matched_strong, matched_moderate)
+    role_hits = _target_role_hits(text)
+
+    clearance_block = _has_clearance_block(text)
+    if clearance_block:
+        dimensions = [
+            EvaluationDimension("risk", 0.10, 0, clearance_block),
+            EvaluationDimension("title_fit", 0.25, 0, "Evaluation stopped because the posting is blocked."),
+            EvaluationDimension("skill_overlap", 0.25, 0, "Evaluation stopped because the posting is blocked."),
+            EvaluationDimension("target_alignment", 0.15, 0, "Evaluation stopped because the posting is blocked."),
+            EvaluationDimension("seniority_fit", 0.10, 0, "Evaluation stopped because the posting is blocked."),
+            EvaluationDimension("location_fit", 0.05, 0, "Evaluation stopped because the posting is blocked."),
+            EvaluationDimension("evidence_quality", 0.10, 0, "Evaluation stopped because the posting is blocked."),
+        ]
+        return EvaluationResult(
+            score=0,
+            label="no",
+            grade="F",
+            matched_strong=matched_strong,
+            matched_moderate=matched_moderate,
+            unsupported_strong=assessment.unsupported_strong,
+            unsupported_moderate=assessment.unsupported_moderate,
+            critical_skill_gaps=assessment.critical_skill_gaps,
+            reasons=[clearance_block],
+            fit_summary=clearance_block,
+            dimensions=dimensions,
+        )
+
+    location_block = _location_block(location, text, require_us_location=require_us_location)
+    if location_block:
+        dimensions = [
+            EvaluationDimension("location_fit", 0.05, 0, location_block),
+            EvaluationDimension("title_fit", 0.25, 0, "Evaluation stopped because the location is outside your allowed market."),
+            EvaluationDimension("skill_overlap", 0.25, 0, "Evaluation stopped because the location is outside your allowed market."),
+            EvaluationDimension("target_alignment", 0.15, 0, "Evaluation stopped because the location is outside your allowed market."),
+            EvaluationDimension("seniority_fit", 0.10, 0, "Evaluation stopped because the location is outside your allowed market."),
+            EvaluationDimension("evidence_quality", 0.10, 0, "Evaluation stopped because the location is outside your allowed market."),
+            EvaluationDimension("risk", 0.10, 92, "No clearance or citizenship blockers were detected."),
+        ]
+        return EvaluationResult(
+            score=0,
+            label="no",
+            grade="F",
+            matched_strong=matched_strong,
+            matched_moderate=matched_moderate,
+            unsupported_strong=assessment.unsupported_strong,
+            unsupported_moderate=assessment.unsupported_moderate,
+            critical_skill_gaps=assessment.critical_skill_gaps,
+            reasons=[location_block],
+            fit_summary=location_block,
+            dimensions=dimensions,
+        )
+
+    title_block = _title_level_block(title)
+    if title_block:
+        dimensions = [
+            EvaluationDimension("seniority_fit", 0.10, 0, title_block),
+            EvaluationDimension("title_fit", 0.25, 0, "Evaluation stopped because the title is above your target level."),
+            EvaluationDimension("skill_overlap", 0.25, 0, "Evaluation stopped because the title is above your target level."),
+            EvaluationDimension("target_alignment", 0.15, 0, "Evaluation stopped because the title is above your target level."),
+            EvaluationDimension("location_fit", 0.05, 0, "Evaluation stopped because the title is above your target level."),
+            EvaluationDimension("evidence_quality", 0.10, 0, "Evaluation stopped because the title is above your target level."),
+            EvaluationDimension("risk", 0.10, 92, "No clearance or citizenship blockers were detected."),
+        ]
+        return EvaluationResult(
+            score=0,
+            label="no",
+            grade="F",
+            matched_strong=matched_strong,
+            matched_moderate=matched_moderate,
+            unsupported_strong=assessment.unsupported_strong,
+            unsupported_moderate=assessment.unsupported_moderate,
+            critical_skill_gaps=assessment.critical_skill_gaps,
+            reasons=[title_block],
+            fit_summary=title_block,
+            dimensions=dimensions,
+        )
+
+    years_required = _extract_years_requirement(text)
+    if years_required >= 4:
+        block_reason = f"Blocked because the role requires {years_required}+ years of experience, above your 0-3 year target range."
+        dimensions = [
+            EvaluationDimension("seniority_fit", 0.10, 0, block_reason),
+            EvaluationDimension("title_fit", 0.25, 0, "Evaluation stopped because the experience requirement is above your target range."),
+            EvaluationDimension("skill_overlap", 0.25, 0, "Evaluation stopped because the experience requirement is above your target range."),
+            EvaluationDimension("target_alignment", 0.15, 0, "Evaluation stopped because the experience requirement is above your target range."),
+            EvaluationDimension("location_fit", 0.05, 0, "Evaluation stopped because the experience requirement is above your target range."),
+            EvaluationDimension("evidence_quality", 0.10, 0, "Evaluation stopped because the experience requirement is above your target range."),
+            EvaluationDimension("risk", 0.10, 92, "No clearance or citizenship blockers were detected."),
+        ]
+        return EvaluationResult(
+            score=0,
+            label="no",
+            grade="F",
+            matched_strong=matched_strong,
+            matched_moderate=matched_moderate,
+            unsupported_strong=assessment.unsupported_strong,
+            unsupported_moderate=assessment.unsupported_moderate,
+            critical_skill_gaps=assessment.critical_skill_gaps,
+            reasons=[block_reason],
+            fit_summary=block_reason,
+            dimensions=dimensions,
+        )
+
+    dimensions = [
+        EvaluationDimension("title_fit", 0.25, *_dimension_title_fit(title)),
+        EvaluationDimension("skill_overlap", 0.25, *_dimension_skill_overlap(matched_strong, matched_moderate, strong_points, moderate_points, assessment)),
+        EvaluationDimension("target_alignment", 0.15, *_dimension_target_alignment(role_hits)),
+        EvaluationDimension("seniority_fit", 0.10, *_dimension_seniority(text)),
+        EvaluationDimension("location_fit", 0.05, *_dimension_location(location, text)),
+        EvaluationDimension("evidence_quality", 0.10, *_dimension_evidence(description, matched_strong, matched_moderate, assessment)),
+        EvaluationDimension("risk", 0.10, *_dimension_risk(text)),
+    ]
+
+    experience_penalty, experience_reason = _experience_penalty(text)
+    score = round(sum(d.weighted_points for d in dimensions) - experience_penalty)
+    evidence_cap, evidence_cap_reason = _evidence_score_cap(description, source)
+    resume_cap, resume_cap_reason = _resume_gap_score_cap(assessment)
+    score = min(score, evidence_cap)
+    score = min(score, resume_cap)
+    score = max(0, min(score, 100))
+    grade = _score_to_grade(score)
+    label = _score_to_label(score)
+
+    ordered = sorted(dimensions, key=lambda d: d.weighted_points, reverse=True)
+    reasons = [d.reason for d in ordered[:4]]
+    if experience_reason:
+        reasons.insert(0, experience_reason)
+    if evidence_cap_reason and evidence_cap_reason not in reasons:
+        reasons.insert(0, evidence_cap_reason)
+    if resume_cap_reason and resume_cap_reason not in reasons:
+        reasons.insert(0, resume_cap_reason)
+    reasons = reasons[:4]
+    fit_summary = f"Grade {grade} ({score}/100). " + " ".join(reasons[:3])
+
+    return EvaluationResult(
+        score=score,
+        label=label,
+        grade=grade,
+        matched_strong=matched_strong,
+        matched_moderate=matched_moderate,
+        unsupported_strong=assessment.unsupported_strong,
+        unsupported_moderate=assessment.unsupported_moderate,
+        critical_skill_gaps=assessment.critical_skill_gaps,
+        reasons=reasons,
+        fit_summary=fit_summary,
+        dimensions=dimensions,
+    )

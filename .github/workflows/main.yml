@@ -1,0 +1,49 @@
+name: Job Radar — Main Sources
+
+on:
+  schedule:
+    - cron: "0 * * * *"      # Every hour
+  workflow_dispatch:           # Manual trigger
+
+permissions:
+  contents: write
+
+concurrency:
+  group: job-radar-state
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Job Radar (main mode)
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DB_PATH: state/gha-jobs.db
+        run: python -m src.main --mode main --no-notify
+
+      - name: Commit state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/gha-jobs.db
+          git diff --cached --quiet || git commit -m "chore: update state [skip ci]"
+          git push origin HEAD:${{ github.ref_name }}
