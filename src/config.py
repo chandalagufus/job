@@ -51,6 +51,7 @@ class BoardsConfig:
     batch_size: int = 50
     workers: int = 12
     timeout: int = 30
+    rescan_cooldown_hours: int = 6
 
 
 @dataclass
@@ -133,6 +134,9 @@ class Config:
         cfg.boards.batch_size = int(os.environ.get("BOARDS_BATCH_SIZE", bo.get("batch_size", 50)))
         cfg.boards.workers = int(os.environ.get("BOARDS_WORKERS", bo.get("workers", 12)))
         cfg.boards.timeout = int(os.environ.get("BOARDS_TIMEOUT", bo.get("timeout", 30)))
+        cfg.boards.rescan_cooldown_hours = int(
+            os.environ.get("BOARDS_RESCAN_COOLDOWN_HOURS", bo.get("rescan_cooldown_hours", 6))
+        )
 
         # Feature toggles
         ft = raw.get("features", {}) or {}

@@ -802,6 +802,20 @@ class Database:
             return False
         return (datetime.now(timezone.utc) - last_checked).total_seconds() < max(cooldown_hours, 1) * 3600
 
+    def was_board_checked_recently(self, board_id: str, *, cooldown_hours: int = 6) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_checked FROM boards WHERE board_id=?",
+                (board_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        try:
+            last_checked = datetime.fromisoformat(str(row["last_checked"] or ""))
+        except ValueError:
+            return False
+        return (datetime.now(timezone.utc) - last_checked).total_seconds() < max(cooldown_hours, 1) * 3600
+
     def upsert_board(
         self,
         *,

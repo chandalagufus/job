@@ -707,6 +707,7 @@ def run_boards(
             db,
             timeout,
             workers,
+            cfg.boards.rescan_cooldown_hours,
             progress_callback=_log_board_progress,
         )
         elapsed = time.time() - t0
@@ -758,7 +759,12 @@ def run_boards(
 
 
 def _process_boards_batch(
-    batch: list[dict], db: Database, timeout: int, workers: int, progress_callback=None
+    batch: list[dict],
+    db: Database,
+    timeout: int,
+    workers: int,
+    board_rescan_cooldown_hours: int,
+    progress_callback=None,
 ) -> tuple[list[Job], list[str], list[dict]]:
     all_jobs: list[Job] = []
     errors: list[str] = []
@@ -766,7 +772,7 @@ def _process_boards_batch(
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = [
-            pool.submit(_process_one_board, b, db, timeout)
+            pool.submit(_process_one_board, b, db, timeout, board_rescan_cooldown_hours)
             for b in batch
         ]
         for fut in as_completed(futures):
@@ -877,7 +883,12 @@ def _get_board_id(b: dict) -> str:
     return f"{platform}:"
 
 
-def _process_one_board(b: dict, db: Database, timeout: int) -> tuple[list[Job], Optional[str], dict]:
+def _process_one_board(
+    b: dict,
+    db: Database,
+    timeout: int,
+    board_rescan_cooldown_hours: int,
+) -> tuple[list[Job], Optional[str], dict]:
     import requests
 
     platform = b["platform"]
@@ -910,6 +921,13 @@ def _process_one_board(b: dict, db: Database, timeout: int) -> tuple[list[Job], 
     if db.should_skip_board(board_id):
         log.debug("Skipping board with repeated empty runs: %s", board_id)
         return [], None, _record(status="skipped", jobs=[], error_text="Skipped after repeated empty runs")
+    if db.was_board_checked_recently(board_id, cooldown_hours=board_rescan_cooldown_hours):
+        log.debug("Skipping recently checked board: %s", board_id)
+        return [], None, _record(
+            status="skipped",
+            jobs=[],
+            error_text=f"Skipped because board was checked within the last {board_rescan_cooldown_hours}h",
+        )
 
     source = _board_source_for(b)
     if source is None:

@@ -36,6 +36,7 @@ boards:
   batch_size: 50       # How many boards to process per run
   workers: 12          # Concurrent board-fetch threads
   timeout: 30          # Per-board HTTP timeout
+  rescan_cooldown_hours: 6
 
 # Feature switchboard (also editable in the web UI)
 features:
