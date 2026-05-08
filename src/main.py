@@ -1051,8 +1051,8 @@ def _dispatch_results(
             )
         log.debug("Saved %d jobs to database.", len(matched))
 
-        # Auto-expiry — clean up jobs not seen in 60 days to keep DB lean
-        db.expire_old_jobs(days=60)
+        # Auto-expiry: clean up jobs not seen in 14 days to keep the DB lean.
+        db.expire_old_jobs(days=14)
     return {
         "matched_keys": {j.key for j in matched},
         "yes_keys": {j.key for j in yes_jobs},
@@ -1340,3 +1340,4 @@ def main(argv: Optional[list[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
+

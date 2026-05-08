@@ -1011,7 +1011,7 @@ class Database:
     # Reporting helpers
     # -------------------------------------------------------------------------
 
-    def expire_old_jobs(self, days: int = 60) -> int:
+    def expire_old_jobs(self, days: int = 14) -> int:
         """Delete jobs not seen within the last `days` days. Returns count deleted."""
         with self._tx() as conn:
             cur = conn.execute(

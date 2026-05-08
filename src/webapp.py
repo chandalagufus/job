@@ -337,6 +337,14 @@ def _layout(title: str, body: str) -> bytes:
     }}
     .actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }}
     .actions label {{ min-width: 140px; flex: 1 1 140px; }}
+    .scan-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }}
+    .scan-card {{ background: #fbfaf6; border: 1px solid var(--line); border-radius: 12px; padding: 14px; }}
+    .scan-card h3 {{ margin: 0 0 8px; font-size: 1rem; }}
+    .scan-card p {{ margin: 0; color: var(--muted); font-size: 0.95rem; }}
+    .danger-card {{ background: #fff7ed; border-color: #fdba74; }}
+    .danger-button {{ background: #b45309; }}
+    .confirm-line {{ display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--muted); font-size: 0.94rem; }}
+    .confirm-line input[type=checkbox] {{ width: auto; }}
     .button-link {{
       display: inline-block; background: var(--accent); color: white; border: 0; border-radius: 999px;
       padding: 10px 16px; text-decoration: none; font-weight: 700;
@@ -344,7 +352,7 @@ def _layout(title: str, body: str) -> bytes:
     .artifact-actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; }}
     .artifact-meta {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }}
     @media (max-width: 880px) {{
-      .grid, .split, .hero {{ grid-template-columns: 1fr; }}
+      .grid, .split, .hero, .scan-grid {{ grid-template-columns: 1fr; }}
       .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .wrap {{ padding: 16px; }}
     }}
@@ -793,9 +801,9 @@ def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int =
             "<h1>Job Review Board</h1>"
             "<p class=\"muted\">Review fresh roles, update your pipeline quickly, and run scans without leaving the page.</p>"
             "<ul class=\"helper-list\">"
-            "<li><strong>Scan Main Sources</strong> refreshes direct company feeds like Amazon, Microsoft, and Google.</li>"
-            "<li><strong>Scan Next Board Batch</strong> checks the next saved ATS slice for a quick incremental update.</li>"
-            "<li><strong>Scan Full Board Sweep</strong> resumes from the current cursor and wraps until every board is covered.</li>"
+            "<li><strong>Scan Main Sources</strong> is the fastest local refresh for direct high-priority companies.</li>"
+            "<li><strong>Scan Next Board Batch</strong> is the recommended local board action when you just want a quick incremental update.</li>"
+            "<li><strong>Scan Full Board Sweep</strong> is intentionally gated because it can take a while and is usually better left to GitHub Actions.</li>"
             "</ul>"
             "</div>"
             "<div class=\"card\">"
@@ -827,11 +835,26 @@ def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int =
             f"<input type=\"hidden\" name=\"status\" value=\"{escape(status)}\">"
             f"<input type=\"hidden\" name=\"sort\" value=\"{escape(sort_by)}\">"
             f"<input type=\"hidden\" name=\"rescore_limit\" value=\"{escape(rescore_limit_raw)}\">"
-            "<button type=\"submit\" name=\"scan_mode\" value=\"main\">Scan Main Sources</button>"
-            "<button type=\"submit\" name=\"scan_mode\" value=\"boards\">Scan Next Board Batch</button>"
-            "<button type=\"submit\" name=\"scan_mode\" value=\"all\">Scan Full Board Sweep</button>"
+            "<div class=\"scan-grid\">"
+            "<div class=\"scan-card\">"
+            "<h3>Scan Main Sources</h3>"
+            "<p>Fastest local refresh for core companies and direct sources.</p>"
+            "<div class=\"actions\"><button type=\"submit\" name=\"scan_mode\" value=\"main\">Run Main Sources</button></div>"
+            "</div>"
+            "<div class=\"scan-card\">"
+            "<h3>Scan Next Board Batch</h3>"
+            "<p>Recommended local board refresh. Advances the saved cursor without doing a full wrap.</p>"
+            "<div class=\"actions\"><button type=\"submit\" name=\"scan_mode\" value=\"boards\">Run Next Board Batch</button></div>"
+            "</div>"
+            "<div class=\"scan-card danger-card\">"
+            "<h3>Scan Full Board Sweep</h3>"
+            "<p>Slowest option. Walks the cursor until every board is covered, so use it only when you explicitly want a full local pass.</p>"
+            "<label class=\"confirm-line\"><input type=\"checkbox\" name=\"confirm_full_sweep\" value=\"1\">I really want a full local sweep</label>"
+            "<div class=\"actions\"><button type=\"submit\" name=\"scan_mode\" value=\"all\" class=\"danger-button\">Run Full Board Sweep</button></div>"
+            "</div>"
+            "</div>"
             "</form>"
-            "<p class=\"muted\">Use the batch scan for a fast refresh. Use the full sweep when you want the whole ATS inventory refreshed from the saved cursor.</p>"
+            "<p class=\"muted\">For day-to-day use, pull the latest repo data, open the web UI, and use either Main Sources or Next Board Batch. Full sweeps are better as occasional manual actions.</p>"
             "</div>"
             "<div class=\"card\">"
             "<h2>Filter Jobs</h2>"
@@ -1380,6 +1403,11 @@ def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int =
             mode = (form.get("scan_mode", "all") or "all").strip().lower()
             if mode not in {"main", "boards", "all"}:
                 mode = "all"
+            if mode == "all" and form.get("confirm_full_sweep") != "1":
+                return _redirect_home(
+                    form,
+                    message="Full board sweep not started. Check the confirmation box if you really want a full local sweep.",
+                )
             started = _start_scan(mode)
             if not started:
                 current = _scan_snapshot()
