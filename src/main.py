@@ -17,6 +17,7 @@ import csv
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -70,6 +71,57 @@ SUPPORTED_BOARD_PLATFORMS = (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _auto_sync_repo_before_web(*, repo_root: str, branch: str = "main") -> None:
+    """Best-effort fast-forward pull before opening the local web UI.
+
+    This keeps the dashboard aligned with the latest GitHub-committed DB state
+    without pulling over local uncommitted work.
+    """
+    git_dir = Path(repo_root) / ".git"
+    if not git_dir.exists():
+        log.info("Web auto-sync skipped: %s is not a git repository.", repo_root)
+        return
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception as exc:
+        log.warning("Web auto-sync skipped: could not inspect git status (%s).", exc)
+        return
+    if status.returncode != 0:
+        detail = (status.stderr or status.stdout or "").strip()
+        log.warning("Web auto-sync skipped: git status failed%s", f" ({detail})" if detail else ".")
+        return
+    if status.stdout.strip():
+        log.info("Web auto-sync skipped: local repo has uncommitted changes.")
+        return
+    try:
+        pull = subprocess.run(
+            ["git", "pull", "--ff-only", "origin", branch],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:
+        log.warning("Web auto-sync failed before startup: %s", exc)
+        return
+    output = (pull.stdout or pull.stderr or "").strip()
+    if pull.returncode == 0:
+        if output:
+            log.info("Web auto-sync: %s", output.replace("\n", " | "))
+        else:
+            log.info("Web auto-sync completed before startup.")
+        return
+    log.warning("Web auto-sync failed before startup: %s", output or f"git exited with {pull.returncode}")
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -1247,6 +1299,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG logging.")
     p.add_argument("--web-host", default="127.0.0.1", help="Web UI host (used with --mode web).")
     p.add_argument("--web-port", type=int, default=8080, help="Web UI port (used with --mode web).")
+    p.add_argument("--web-no-git-sync", action="store_true", help="Skip the automatic git pull before starting the web UI.")
 
     # Boards options
     bg = p.add_argument_group("Boards mode options")
@@ -1267,6 +1320,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     setup_logging(args.verbose)
+
+    if args.mode == "web" and not args.web_no_git_sync:
+        _auto_sync_repo_before_web(repo_root=str(Path(ROOT_DIR)), branch="main")
 
     cfg = Config.load(args.config)
 
