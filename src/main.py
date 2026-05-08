@@ -143,6 +143,27 @@ def _resolve_boards_csv(cfg_path: str) -> str:
     raise FileNotFoundError("Could not locate a boards CSV file. Specify --boards-csv or set BOARDS_CSV.")
 
 
+def _resolve_priority_csv(csv_path: str) -> str:
+    """Resolve the curated priority-company CSV."""
+    candidates = [
+        csv_path,
+        os.environ.get("PRIORITY_CSV", ""),
+        "data/boards/PRIORITY_COMPANIES.csv",
+    ]
+    for raw in candidates:
+        if not raw:
+            continue
+        p = Path(os.path.expanduser(raw))
+        if not p.is_absolute():
+            for base in (Path.cwd(), Path(ROOT_DIR)):
+                candidate = base / p
+                if candidate.exists():
+                    return str(candidate)
+        elif p.exists():
+            return str(p)
+    raise FileNotFoundError("Could not locate a priority companies CSV file. Specify --priority-csv or set PRIORITY_CSV.")
+
+
 # ---------------------------------------------------------------------------
 # Notifier factory
 # ---------------------------------------------------------------------------
@@ -232,15 +253,7 @@ def _load_structured_json(raw: str) -> dict:
 # Main mode: company career pages
 # ---------------------------------------------------------------------------
 
-def run_main(cfg: Config, db: Database, notifier: CompositeNotifier, *, dry_run: bool, no_notify: bool, test_notify: bool) -> None:
-    """Fetch jobs from configured company sources concurrently."""
-    if not db.get_feature_flags({"scanner_main": cfg.features.scanner_main})["scanner_main"]:
-        log.warning("scanner_main feature is disabled. Skipping main mode run.")
-        return
-
-    timeout = cfg.http_timeout
-
-    # Build source list based on config
+def _build_main_sources(cfg: Config) -> list[object]:
     sources = []
     if cfg.source("microsoft").enabled:
         sources.append(EightfoldSource("microsoft", max_jobs=cfg.source("microsoft").max_jobs))
@@ -266,6 +279,19 @@ def run_main(cfg: Config, db: Database, notifier: CompositeNotifier, *, dry_run:
         sources.append(StripeSource(max_jobs=cfg.source("stripe").max_jobs))
     if cfg.source("linkedin").enabled:
         sources.append(LinkedInSource(max_jobs=cfg.source("linkedin").max_jobs))
+    return sources
+
+
+def run_main(cfg: Config, db: Database, notifier: CompositeNotifier, *, dry_run: bool, no_notify: bool, test_notify: bool) -> None:
+    """Fetch jobs from configured company sources concurrently."""
+    if not db.get_feature_flags({"scanner_main": cfg.features.scanner_main})["scanner_main"]:
+        log.warning("scanner_main feature is disabled. Skipping main mode run.")
+        return
+
+    timeout = cfg.http_timeout
+
+    # Build source list based on config
+    sources = _build_main_sources(cfg)
 
     if not sources:
         log.warning("No sources enabled.")
@@ -329,6 +355,119 @@ def run_main(cfg: Config, db: Database, notifier: CompositeNotifier, *, dry_run:
             no_notify=no_notify,
             test_notify=test_notify,
             mode="main",
+        )
+
+
+def run_priority(
+    cfg: Config,
+    db: Database,
+    notifier: CompositeNotifier,
+    *,
+    priority_csv: str,
+    timeout: int,
+    workers: int,
+    dry_run: bool,
+    no_notify: bool,
+    test_notify: bool,
+    notify_yes_only: bool = False,
+) -> None:
+    """Run the frequent/high-priority company set: main sources + curated boards."""
+    all_jobs: list[Job] = []
+    errors: list[str] = []
+    run_records: list[dict] = []
+
+    if db.get_feature_flags({"scanner_main": cfg.features.scanner_main})["scanner_main"]:
+        main_sources = _build_main_sources(cfg)
+        if main_sources:
+            log.info("Running PRIORITY mode main sources — %d source(s)", len(main_sources))
+            with ThreadPoolExecutor(max_workers=min(len(main_sources), 12)) as pool:
+                future_map = {
+                    pool.submit(_fetch_source_metrics, src, db, cfg.http_timeout): src.name
+                    for src in main_sources
+                }
+                for fut in as_completed(future_map):
+                    src_name = future_map[fut]
+                    try:
+                        jobs, record = fut.result()
+                        run_records.append(record)
+                        all_jobs.extend(jobs)
+                        log.info("%-20s fetched %d jobs", src_name, record["fetched_count"])
+                    except Exception as exc:
+                        err = f"{src_name}: {type(exc).__name__}: {exc}"
+                        errors.append(err)
+                        now = datetime.now(timezone.utc).isoformat()
+                        run_records.append(
+                            {
+                                "source_key": src_name,
+                                "entity_type": "main",
+                                "mode": "priority",
+                                "platform": src_name,
+                                "company": src_name.replace("_", " ").title(),
+                                "url": "",
+                                "status": "error",
+                                "started_at": now,
+                                "finished_at": now,
+                                "latency_ms": 0,
+                                "fetched_count": 0,
+                                "jd_coverage": 0.0,
+                                "error_text": err,
+                                "job_keys": [],
+                            }
+                        )
+                        log.error("Priority source failed — %s", err)
+
+    if not db.get_feature_flags({"scanner_boards": cfg.features.scanner_boards})["scanner_boards"]:
+        log.warning("scanner_boards feature is disabled. Skipping curated priority boards.")
+    else:
+        boards = load_boards_csv(priority_csv)
+        boards = [b for b in boards if b.get("platform") in SUPPORTED_BOARD_PLATFORMS]
+        if boards:
+            platform_counts = Counter(b["platform"] for b in boards)
+            log.info(
+                "Running PRIORITY mode boards — %d curated rows | %s",
+                len(boards),
+                " ".join(f"{p}={c}" for p, c in sorted(platform_counts.items())),
+            )
+            board_jobs, board_errors, board_records = _process_boards_batch(
+                boards, db, timeout, workers, progress_callback=None
+            )
+            all_jobs.extend(board_jobs)
+            errors.extend(board_errors)
+            run_records.extend(board_records)
+            log.info(
+                "Priority boards done — %d jobs fetched, %d errors",
+                len(board_jobs),
+                len(board_errors),
+            )
+        else:
+            log.warning("No supported curated priority boards found in CSV.")
+
+    if not run_records:
+        log.warning("No priority sources were run.")
+        return
+
+    summary = _dispatch_results(
+        all_jobs=all_jobs,
+        errors=errors,
+        db=db,
+        notifier=notifier,
+        mode="priority",
+        dry_run=dry_run,
+        no_notify=no_notify,
+        test_notify=test_notify,
+        cfg=cfg,
+        notify_yes_only=notify_yes_only,
+    )
+    if not dry_run:
+        notifications_enabled = db.get_feature_flags({"notifications": cfg.features.notifications})["notifications"]
+        alert_lines = _record_run_history(db=db, run_records=run_records, summary=summary, mode="priority")
+        _maybe_send_failure_alerts(
+            notifier=notifier,
+            alert_lines=alert_lines,
+            notifications_enabled=notifications_enabled,
+            no_notify=no_notify,
+            test_notify=test_notify,
+            mode="priority",
         )
 
 
@@ -1054,7 +1193,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Job Radar — aggregate and alert on new engineering jobs.",
     )
     p.add_argument("--config", default="config.yaml", help="Path to YAML config file (default: config.yaml)")
-    p.add_argument("--mode", default="main", choices=["main", "boards", "web"], help="Run mode (default: main)")
+    p.add_argument("--mode", default="main", choices=["main", "boards", "priority", "web"], help="Run mode (default: main)")
     p.add_argument("--dry-run", action="store_true", help="Fetch jobs but do not save state or send notifications.")
     p.add_argument("--no-notify", action="store_true", help="Save state but skip all notifications.")
     p.add_argument("--notify-yes-only", action="store_true", help="Send notifications only when there is at least one YES match; include MAYBE matches only alongside YES alerts.")
@@ -1073,6 +1212,7 @@ def build_parser() -> argparse.ArgumentParser:
     bg.add_argument("--boards-run-until-wrap", action="store_true", help="Run batches until cursor wraps (full sweep).")
     bg.add_argument("--boards-max-iterations", type=int, default=2000, help="Safety cap for --boards-run-until-wrap.")
     bg.add_argument("--export-dead-csv", default="", help="Export dead boards to a CSV file.")
+    bg.add_argument("--priority-csv", default="", help="Path to curated priority-companies CSV file.")
 
     return p
 
@@ -1125,6 +1265,27 @@ def main(argv: Optional[list[str]] = None) -> None:
                 run_until_wrap=args.boards_run_until_wrap,
                 max_iterations=args.boards_max_iterations,
                 export_dead_csv=args.export_dead_csv,
+            )
+        elif args.mode == "priority":
+            try:
+                priority_csv = _resolve_priority_csv(args.priority_csv)
+            except FileNotFoundError as exc:
+                log.error("%s", exc)
+                sys.exit(1)
+
+            timeout = args.boards_timeout or cfg.boards.timeout
+            workers = args.boards_workers or cfg.boards.workers
+            run_priority(
+                cfg=cfg,
+                db=db,
+                notifier=notifier,
+                priority_csv=priority_csv,
+                timeout=timeout,
+                workers=workers,
+                dry_run=args.dry_run,
+                no_notify=args.no_notify,
+                test_notify=args.test_notify,
+                notify_yes_only=args.notify_yes_only,
             )
         else:
             serve_web(cfg=cfg, db=db, host=args.web_host, port=args.web_port)
