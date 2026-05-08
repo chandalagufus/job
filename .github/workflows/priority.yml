@@ -49,5 +49,15 @@ jobs:
             exit 0
           fi
           git commit -m "chore: update priority state [skip ci]"
-          git pull --rebase origin ${{ github.ref_name }}
-          git push origin HEAD:${{ github.ref_name }}
+          for attempt in 1 2 3; do
+            git pull --rebase origin ${{ github.ref_name }}
+            if git push origin HEAD:${{ github.ref_name }}; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Push race detected on attempt $attempt; retrying after a short pause."
+              sleep 3
+            fi
+          done
+          echo "State push failed after 3 attempts."
+          exit 1
