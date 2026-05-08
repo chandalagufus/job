@@ -21,6 +21,7 @@ _PROJECTS_SECTION_RE = re.compile(
 
 
 def _default_base_resume() -> str:
+    signature_name = str(PROFILE.get("name") or "Candidate Name")
     return "\n".join(
         [
             f"# {PROFILE['name']}",
@@ -513,7 +514,7 @@ def _build_cover_letter(job: dict, evaluation: EvaluationResult, selected_hades:
             f"For this role, the strongest overlap is in {matched_text}. I can contribute to AI-ready data layers, reproducible pipelines, and data products that are useful to both scientists and engineers while staying grounded in maintainable systems and clear outcomes.",
             "",
             "Sincerely,",
-            "Vasishta Chandala",
+            signature_name,
         ]
     ).strip() + "\n"
 
