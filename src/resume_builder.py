@@ -501,6 +501,7 @@ def _build_cover_letter(job: dict, evaluation: EvaluationResult, selected_hades:
     role_focus = _best_role_focus(job, evaluation)
     hades_proof = selected_hades[0] if selected_hades else "I built end-to-end data and ML workflows across Python, SQL, and cloud data systems."
     hive_proof = selected_hive[0] if selected_hive else "I translated product and user data into measurable business outcomes."
+    signature_name = str(PROFILE.get("name") or "Candidate Name")
     return "\n".join(
         [
             f"# Cover Letter -- {company} -- {title}",
