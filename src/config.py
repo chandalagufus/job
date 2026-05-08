@@ -155,7 +155,7 @@ class Config:
         defaults = {
             "microsoft": 300, "nvidia": 300, "amazon": 300,
             "goldman_sachs": 200, "ibm": 200, "oracle": 200,
-            "meta": 200, "google": 200, "apple": 200,
+            "meta": 100, "google": 200, "apple": 200,
             "netflix": 200, "stripe": 200,
             "linkedin": 100,
         }

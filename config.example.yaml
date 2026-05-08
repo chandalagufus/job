@@ -76,7 +76,7 @@ sources:
 
   meta:
     enabled: true
-    max_jobs: 200
+    max_jobs: 100
 
   google:
     enabled: true
