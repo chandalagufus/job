@@ -47,7 +47,7 @@ jobs:
           ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          DB_PATH: state/gha-jobs.db
+          DB_PATH: state/turso-gha-jobs.db
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           TURSO_SYNC_INTERVAL_SECONDS: "15"
@@ -62,7 +62,7 @@ jobs:
 
       - name: Export dead boards report
         env:
-          DB_PATH: state/gha-jobs.db
+          DB_PATH: state/turso-gha-jobs.db
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           TURSO_SYNC_INTERVAL_SECONDS: "15"
@@ -71,6 +71,10 @@ jobs:
 
       - name: Commit state
         run: |
+          if [ -n "${{ secrets.TURSO_DATABASE_URL }}" ]; then
+            echo "Turso enabled; skipping local state DB commit."
+            exit 0
+          fi
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state/gha-jobs.db
