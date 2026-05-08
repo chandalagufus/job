@@ -52,12 +52,22 @@ from .sources.ashby import AshbySource, _board_id as ashby_board_id
 from .sources.workable import WorkableSource, _board_id as workable_board_id
 from .sources.jobvite import JobviteSource, _board_id as jobvite_board_id
 from .sources.icims import ICIMSSource, _board_id as icims_board_id
+from .sources.recruitee import RecruiteeSource, _board_id as recruitee_board_id
+from .sources.breezyhr import BreezyHRSource, _board_id as breezyhr_board_id
+from .sources.teamtailor import TeamtailorSource, _board_id as teamtailor_board_id
+from .sources.dover import DoverSource, _board_id as dover_board_id
+from .sources.gem import GemSource, _board_id as gem_board_id
+from .sources.wellfound import WellfoundSource, _board_id as wellfound_board_id
+from .sources.workatastartup import WorkAtAStartupSource, _board_id as workatastartup_board_id
 from .webapp import serve_web
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 
-SUPPORTED_BOARD_PLATFORMS = ("greenhouse", "lever", "smartrecruiters", "workday", "ashby", "workable", "jobvite", "icims")
+SUPPORTED_BOARD_PLATFORMS = (
+    "greenhouse", "lever", "smartrecruiters", "workday", "ashby", "workable", "jobvite", "icims",
+    "recruitee", "breezyhr", "teamtailor", "dover", "gem", "wellfound", "workatastartup",
+)
 
 log = logging.getLogger(__name__)
 
@@ -535,6 +545,13 @@ _BOARD_SEMAPHORES: dict[str, threading.Semaphore] = {
     "workable": threading.Semaphore(6),
     "jobvite": threading.Semaphore(6),
     "icims": threading.Semaphore(6),
+    "recruitee": threading.Semaphore(6),
+    "breezyhr": threading.Semaphore(6),
+    "teamtailor": threading.Semaphore(6),
+    "dover": threading.Semaphore(6),
+    "gem": threading.Semaphore(6),
+    "wellfound": threading.Semaphore(4),
+    "workatastartup": threading.Semaphore(4),
 }
 
 
@@ -751,6 +768,20 @@ def _board_source_for(b: dict) -> Optional[object]:
         return JobviteSource(company, url)
     if platform == "icims":
         return ICIMSSource(company, url)
+    if platform == "recruitee":
+        return RecruiteeSource(company, url)
+    if platform == "breezyhr":
+        return BreezyHRSource(company, url)
+    if platform == "teamtailor":
+        return TeamtailorSource(company, url)
+    if platform == "dover":
+        return DoverSource(company, url)
+    if platform == "gem":
+        return GemSource(company, url)
+    if platform == "wellfound":
+        return WellfoundSource(company, url)
+    if platform == "workatastartup":
+        return WorkAtAStartupSource(company, url)
     return None
 
 
@@ -773,6 +804,20 @@ def _get_board_id(b: dict) -> str:
         return jobvite_board_id(url)
     if platform == "icims":
         return icims_board_id(url)
+    if platform == "recruitee":
+        return recruitee_board_id(url)
+    if platform == "breezyhr":
+        return breezyhr_board_id(url)
+    if platform == "teamtailor":
+        return teamtailor_board_id(url)
+    if platform == "dover":
+        return dover_board_id(url)
+    if platform == "gem":
+        return gem_board_id(url)
+    if platform == "wellfound":
+        return wellfound_board_id(url)
+    if platform == "workatastartup":
+        return workatastartup_board_id(url)
     return f"{platform}:"
 
 
