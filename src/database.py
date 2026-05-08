@@ -39,6 +39,49 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class _CompatCursor:
+    """Wrap libsql tuple rows into dict-like rows keyed by column name."""
+
+    def __init__(self, cursor: Any) -> None:
+        self._cursor = cursor
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+    def _normalize_row(self, row: Any) -> Any:
+        if row is None or isinstance(row, dict) or isinstance(row, sqlite3.Row):
+            return row
+        if not isinstance(row, tuple):
+            return row
+        description = getattr(self._cursor, "description", None) or []
+        column_names = [str(col[0]) for col in description if col]
+        if len(column_names) == len(row):
+            return {column_names[idx]: value for idx, value in enumerate(row)}
+        return row
+
+    def fetchone(self) -> Any:
+        return self._normalize_row(self._cursor.fetchone())
+
+    def fetchall(self) -> list[Any]:
+        return [self._normalize_row(row) for row in self._cursor.fetchall()]
+
+
+class _CompatConnection:
+    """Provide sqlite3-like row behavior for libsql connections."""
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def execute(self, *args, **kwargs) -> _CompatCursor:
+        return _CompatCursor(self._conn.execute(*args, **kwargs))
+
+    def cursor(self, *args, **kwargs) -> _CompatCursor:
+        return _CompatCursor(self._conn.cursor(*args, **kwargs))
+
+
 CREATE_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -168,17 +211,26 @@ class Database:
         self._last_sync_monotonic = 0.0
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = self._connect(path)
-        self._conn.row_factory = sqlite3.Row
-        if self._uses_turso:
-            self.sync(force=True)
-        self._conn.executescript(CREATE_SQL)
+        raw_conn = self._connect(path)
+        if hasattr(raw_conn, "row_factory"):
+            raw_conn.row_factory = sqlite3.Row
+            self._conn = raw_conn
+        else:
+            self._conn = _CompatConnection(raw_conn)
+        self._apply_schema_script(CREATE_SQL)
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._ensure_schema()
         self._conn.commit()
         if self._uses_turso:
             self.sync(force=True)
         log.debug("Database opened: %s", path)
+
+    def _apply_schema_script(self, script: str) -> None:
+        statements = [chunk.strip() for chunk in script.split(";") if chunk.strip()]
+        for statement in statements:
+            if self._uses_turso and statement.upper() == "PRAGMA JOURNAL_MODE=WAL":
+                continue
+            self._conn.execute(statement)
 
     def _connect(self, path: str) -> Any:
         if not self._uses_turso:

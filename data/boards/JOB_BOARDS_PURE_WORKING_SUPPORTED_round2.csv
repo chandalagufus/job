@@ -1285,3 +1285,7 @@ Clay Labs,ashby,https://jobs.ashbyhq.com/claylabs,,Imported from career-ops trac
 Hightouch,greenhouse,https://job-boards.greenhouse.io/hightouch,,Imported from career-ops tracked_companies
 WorkOS,ashby,https://jobs.ashbyhq.com/workos,,Imported from career-ops tracked_companies
 Inngest,ashby,https://jobs.ashbyhq.com/inngest,,Imported from career-ops tracked_companies
+Gem,gem,https://www.gem.com/careers,US,Added to exercise new Gem adapter against a public careers page
+Teamtailor,teamtailor,https://career.teamtailor.com/,Global,Added to exercise new Teamtailor adapter against a public careers page
+Wellfound,wellfound,https://wellfound.com/jobs,US,Added to exercise new Wellfound adapter against the public startup jobs page
+Y Combinator Work at a Startup,workatastartup,https://www.workatastartup.com/job_list,US,Added to exercise new Work at a Startup adapter against the public YC jobs board
