@@ -2,7 +2,7 @@ name: Job Radar — Board Sweep
 
 on:
   schedule:
-    - cron: "30 * * * *"     # Every hour at :30 (offset so it doesn't clash with main)
+    - cron: "0 */3 * * *"    # Every 3 hours
   workflow_dispatch:
     inputs:
       batch_size:
