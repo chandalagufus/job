@@ -417,6 +417,14 @@ def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int =
         with scan_lock:
             return dict(scan_state)
 
+    def _open_worker_db() -> Database:
+        return Database(
+            cfg.database.path,
+            turso_url=cfg.database.turso_url,
+            turso_auth_token=cfg.database.turso_auth_token,
+            turso_sync_interval_seconds=cfg.database.turso_sync_interval_seconds,
+        )
+
     def _set_scan_state(**updates) -> None:
         with scan_lock:
             scan_state.update(updates)
@@ -429,25 +437,27 @@ def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int =
         started_at = datetime.now(timezone.utc).isoformat()
         batch_size = max(int(cfg.boards.batch_size or 0), 1)
         if mode == "boards":
-            cursor = worker_db_cursor = Database(cfg.database.path).get_cursor("boards_main")
+            cursor_db = _open_worker_db()
+            cursor = worker_db_cursor = cursor_db.get_cursor("boards_main")
             try:
                 worker_db_cursor = int(worker_db_cursor or 0)
             except Exception:
                 worker_db_cursor = 0
             finally:
-                Database(cfg.database.path).close()
+                cursor_db.close()
             message = (
                 f"Started next board batch at {started_at}. "
                 f"It will scan up to {batch_size} boards from the current cursor ({worker_db_cursor})."
             )
         elif mode == "all":
-            cursor = worker_db_cursor = Database(cfg.database.path).get_cursor("boards_main")
+            cursor_db = _open_worker_db()
+            cursor = worker_db_cursor = cursor_db.get_cursor("boards_main")
             try:
                 worker_db_cursor = int(worker_db_cursor or 0)
             except Exception:
                 worker_db_cursor = 0
             finally:
-                Database(cfg.database.path).close()
+                cursor_db.close()
             message = (
                 f"Started full board sweep at {started_at}. "
                 f"It resumes from the current cursor ({worker_db_cursor}) and wraps until all boards are covered."
@@ -465,7 +475,7 @@ def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int =
         def _worker() -> None:
             from .main import _resolve_boards_csv, build_notifier, run_boards, run_main
 
-            worker_db = Database(cfg.database.path)
+            worker_db = _open_worker_db()
             notifier = build_notifier(cfg)
             try:
                 if mode in {"main", "all"}:
@@ -1357,6 +1367,11 @@ def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int =
         path = environ.get("PATH_INFO", "/") or "/"
         method = environ.get("REQUEST_METHOD", "GET").upper()
         query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+        if method == "GET":
+            try:
+                db.sync()
+            except Exception as exc:
+                log.warning("Dashboard sync skipped: %s", exc)
 
         def _redirect_home(form: dict[str, str | list[str]] | None = None, *, message: str = ""):
             form = form or {}

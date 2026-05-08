@@ -38,6 +38,9 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DB_PATH: state/gha-jobs.db
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TURSO_SYNC_INTERVAL_SECONDS: "15"
         run: python -m src.main --mode priority --notify-yes-only
 
       - name: Commit state

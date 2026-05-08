@@ -123,6 +123,15 @@ def _auto_sync_repo_before_web(*, repo_root: str, branch: str = "main") -> None:
         return
     log.warning("Web auto-sync failed before startup: %s", output or f"git exited with {pull.returncode}")
 
+
+def _open_database(cfg: Config) -> Database:
+    return Database(
+        cfg.database.path,
+        turso_url=cfg.database.turso_url,
+        turso_auth_token=cfg.database.turso_auth_token,
+        turso_sync_interval_seconds=cfg.database.turso_sync_interval_seconds,
+    )
+
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
@@ -1326,7 +1335,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     cfg = Config.load(args.config)
 
-    db = Database(cfg.database.path)
+    db = _open_database(cfg)
 
     notifier = build_notifier(cfg)
 

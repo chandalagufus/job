@@ -11,9 +11,15 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
+
+try:
+    import libsql  # type: ignore
+except ImportError:
+    libsql = None
 
 from .job_intelligence import (
     description_similarity,
@@ -146,31 +152,75 @@ CREATE INDEX IF NOT EXISTS idx_source_runs_finished_at ON source_runs(finished_a
 
 
 class Database:
-    def __init__(self, path: str) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        turso_url: str = "",
+        turso_auth_token: str = "",
+        turso_sync_interval_seconds: int = 15,
+    ) -> None:
         self.path = path
+        self.turso_url = (turso_url or "").strip()
+        self.turso_auth_token = (turso_auth_token or "").strip()
+        self._uses_turso = bool(self.turso_url)
+        self._sync_interval_seconds = max(int(turso_sync_interval_seconds or 0), 0)
+        self._last_sync_monotonic = 0.0
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
-        self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        self._conn = self._connect(path)
+        self._conn.row_factory = sqlite3.Row
+        if self._uses_turso:
+            self.sync(force=True)
         self._conn.executescript(CREATE_SQL)
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._ensure_schema()
         self._conn.commit()
+        if self._uses_turso:
+            self.sync(force=True)
         log.debug("Database opened: %s", path)
+
+    def _connect(self, path: str) -> Any:
+        if not self._uses_turso:
+            return sqlite3.connect(path, check_same_thread=False, timeout=30)
+        if libsql is None:
+            raise RuntimeError(
+                "Turso database requested, but the 'libsql' package is not installed. "
+                "Install dependencies with 'pip install -r requirements.txt'."
+            )
+        log.info("Opening Turso-backed embedded replica at %s", path)
+        kwargs: dict[str, object] = {"sync_url": self.turso_url}
+        if self.turso_auth_token:
+            kwargs["auth_token"] = self.turso_auth_token
+        return libsql.connect(path, **kwargs)
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
 
     @contextmanager
-    def _tx(self) -> Iterator[sqlite3.Connection]:
+    def _tx(self) -> Iterator[Any]:
         with self._lock:
             try:
                 yield self._conn
                 self._conn.commit()
+                if self._uses_turso:
+                    self.sync(force=True)
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def sync(self, *, force: bool = False) -> bool:
+        if not self._uses_turso or not hasattr(self._conn, "sync"):
+            return False
+        now = time.monotonic()
+        if not force and self._sync_interval_seconds > 0:
+            if now - self._last_sync_monotonic < self._sync_interval_seconds:
+                return False
+        with self._lock:
+            self._conn.sync()
+            self._last_sync_monotonic = time.monotonic()
+        return True
 
     def _ensure_schema(self) -> None:
         job_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
