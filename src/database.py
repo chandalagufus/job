@@ -803,6 +803,8 @@ class Database:
         return (datetime.now(timezone.utc) - last_checked).total_seconds() < max(cooldown_hours, 1) * 3600
 
     def was_board_checked_recently(self, board_id: str, *, cooldown_hours: int = 6) -> bool:
+        if int(cooldown_hours or 0) <= 0:
+            return False
         with self._lock:
             row = self._conn.execute(
                 "SELECT last_checked FROM boards WHERE board_id=?",
