@@ -8,7 +8,9 @@ from html import escape
 import json
 import logging
 import re
+import subprocess
 import threading
+import time
 from urllib.parse import parse_qs, quote
 from wsgiref.simple_server import make_server
 
@@ -402,9 +404,19 @@ def _layout(title: str, body: str) -> bytes:
     return html.encode("utf-8")
 
 
-def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int = 8080) -> None:
+def serve_web(
+    cfg: Config,
+    db: Database,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    repo_root: str = "",
+    auto_pull_interval_seconds: int = 300,
+) -> None:
     defaults = _feature_defaults(cfg)
+    db_lock = threading.RLock()
     scan_lock = threading.Lock()
+    last_repo_pull_monotonic = 0.0
     scan_state: dict[str, object] = {
         "running": False,
         "mode": "",
@@ -418,16 +430,67 @@ def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int =
             return dict(scan_state)
 
     def _open_worker_db() -> Database:
-        return Database(
-            cfg.database.path,
-            turso_url=cfg.database.turso_url,
-            turso_auth_token=cfg.database.turso_auth_token,
-            turso_sync_interval_seconds=cfg.database.turso_sync_interval_seconds,
-        )
+        return Database(cfg.database.path)
 
     def _set_scan_state(**updates) -> None:
         with scan_lock:
             scan_state.update(updates)
+
+    def _replace_dashboard_db() -> None:
+        nonlocal db
+        replacement = Database(cfg.database.path)
+        with db_lock:
+            old_db = db
+            db = replacement
+        try:
+            old_db.close()
+        except Exception:
+            pass
+
+    def _maybe_pull_repo() -> None:
+        nonlocal last_repo_pull_monotonic
+        if not repo_root or auto_pull_interval_seconds <= 0:
+            return
+        now = time.monotonic()
+        if now - last_repo_pull_monotonic < auto_pull_interval_seconds:
+            return
+        last_repo_pull_monotonic = now
+        if _scan_snapshot().get("running"):
+            return
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except Exception as exc:
+            log.warning("Dashboard auto-pull skipped: git status failed (%s).", exc)
+            return
+        if status.returncode != 0 or status.stdout.strip():
+            return
+        try:
+            pull = subprocess.run(
+                ["git", "pull", "--ff-only", "origin", "main"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception as exc:
+            log.warning("Dashboard auto-pull failed: %s", exc)
+            return
+        output = (pull.stdout or pull.stderr or "").strip()
+        if pull.returncode != 0:
+            log.warning("Dashboard auto-pull failed: %s", output or f"git exited with {pull.returncode}")
+            return
+        if "Already up to date." in output or "Already up-to-date." in output:
+            return
+        log.info("Dashboard auto-pull refreshed repo state.")
+        _replace_dashboard_db()
 
     def _start_scan(mode: str) -> bool:
         current = _scan_snapshot()
@@ -1368,10 +1431,7 @@ def serve_web(cfg: Config, db: Database, *, host: str = "127.0.0.1", port: int =
         method = environ.get("REQUEST_METHOD", "GET").upper()
         query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
         if method == "GET":
-            try:
-                db.sync()
-            except Exception as exc:
-                log.warning("Dashboard sync skipped: %s", exc)
+            _maybe_pull_repo()
 
         def _redirect_home(form: dict[str, str | list[str]] | None = None, *, message: str = ""):
             form = form or {}

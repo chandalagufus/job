@@ -125,12 +125,7 @@ def _auto_sync_repo_before_web(*, repo_root: str, branch: str = "main") -> None:
 
 
 def _open_database(cfg: Config) -> Database:
-    return Database(
-        cfg.database.path,
-        turso_url=cfg.database.turso_url,
-        turso_auth_token=cfg.database.turso_auth_token,
-        turso_sync_interval_seconds=cfg.database.turso_sync_interval_seconds,
-    )
+    return Database(cfg.database.path)
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -1398,7 +1393,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 notify_yes_only=args.notify_yes_only,
             )
         else:
-            serve_web(cfg=cfg, db=db, host=args.web_host, port=args.web_port)
+            serve_web(
+                cfg=cfg,
+                db=db,
+                host=args.web_host,
+                port=args.web_port,
+                repo_root=str(Path(ROOT_DIR)),
+                auto_pull_interval_seconds=300,
+            )
     finally:
         db.close()
 

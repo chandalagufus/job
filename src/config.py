@@ -37,10 +37,7 @@ class DiscordConfig:
 
 @dataclass
 class DatabaseConfig:
-    path: str = "state/jobs.db"
-    turso_url: str = ""
-    turso_auth_token: str = ""
-    turso_sync_interval_seconds: int = 15
+    path: str = "state/gha-jobs.db"
 
 
 @dataclass
@@ -119,12 +116,7 @@ class Config:
 
         # Database
         db = raw.get("database", {}) or {}
-        cfg.database.path = os.environ.get("DB_PATH", db.get("path", "state/jobs.db"))
-        cfg.database.turso_url = os.environ.get("TURSO_DATABASE_URL", db.get("turso_url", ""))
-        cfg.database.turso_auth_token = os.environ.get("TURSO_AUTH_TOKEN", db.get("turso_auth_token", ""))
-        cfg.database.turso_sync_interval_seconds = int(
-            os.environ.get("TURSO_SYNC_INTERVAL_SECONDS", db.get("turso_sync_interval_seconds", 15))
-        )
+        cfg.database.path = os.environ.get("DB_PATH", db.get("path", "state/gha-jobs.db"))
 
         # Filter
         fi = raw.get("filter", {}) or {}
