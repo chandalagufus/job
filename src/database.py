@@ -805,6 +805,9 @@ class Database:
     def was_board_checked_recently(self, board_id: str, *, cooldown_hours: int = 6) -> bool:
         if int(cooldown_hours or 0) <= 0:
             return False
+        latest_run = self.get_latest_source_run(board_id, "board")
+        if latest_run is not None and int(latest_run.get("new_count") or 0) > 0:
+            return False
         with self._lock:
             row = self._conn.execute(
                 "SELECT last_checked FROM boards WHERE board_id=?",

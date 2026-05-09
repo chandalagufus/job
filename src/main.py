@@ -17,6 +17,7 @@ import csv
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -126,6 +127,14 @@ def _auto_sync_repo_before_web(*, repo_root: str, branch: str = "main") -> None:
 
 def _open_database(cfg: Config) -> Database:
     return Database(cfg.database.path)
+
+
+def _web_port_responding(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except OSError:
+        return False
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -1343,8 +1352,12 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     setup_logging(args.verbose)
 
-    if args.mode == "web" and not args.web_no_git_sync:
-        _auto_sync_repo_before_web(repo_root=str(Path(ROOT_DIR)), branch="main")
+    if args.mode == "web":
+        if _web_port_responding(args.web_host, args.web_port):
+            log.warning("A web server is already responding at http://%s:%d", args.web_host, args.web_port)
+            return
+        if not args.web_no_git_sync:
+            _auto_sync_repo_before_web(repo_root=str(Path(ROOT_DIR)), branch="main")
 
     cfg = Config.load(args.config)
 

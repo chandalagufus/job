@@ -17,6 +17,13 @@ python -m src.main --test-notify
 python -m src.main --health-check
 ```
 
+## Operating model
+
+- `public-export` is the public GitHub Actions repo and the remote automation source of truth.
+- `job-radar` is the local development repo.
+- Public GitHub board sweeps run every 2 hours with no cooldown.
+- Local dashboard launches can still compare `public-export/state/gha-jobs.db` with the sibling `job-radar` DB and surface which one is active.
+
 ## Useful variants
 
 ```powershell

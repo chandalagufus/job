@@ -7,10 +7,14 @@ import hashlib
 from html import escape
 import json
 import logging
+import os
 import re
+import shutil
+import sqlite3
 import subprocess
 import threading
 import time
+from pathlib import Path
 from urllib.parse import parse_qs, quote
 from wsgiref.simple_server import make_server
 
@@ -49,6 +53,154 @@ DATE_FORMATS = (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_db_path(repo_root: str, raw_path: str) -> Path:
+    candidate = Path(os.path.expanduser(raw_path))
+    if candidate.is_absolute():
+        return candidate
+    base = Path(repo_root) if repo_root else Path.cwd()
+    return (base / candidate).resolve()
+
+
+def _db_snapshot(path: Path) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "path": path,
+        "exists": path.exists(),
+        "total_jobs": 0,
+        "recent_jobs_24h": 0,
+        "last_seen": "",
+        "fresh_ts": 0.0,
+    }
+    if not path.exists():
+        return snapshot
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.row_factory = sqlite3.Row
+        snapshot["total_jobs"] = int(conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+        snapshot["recent_jobs_24h"] = int(
+            conn.execute("SELECT COUNT(*) FROM jobs WHERE last_seen >= datetime('now','-1 day')").fetchone()[0]
+        )
+        last_seen = str(conn.execute("SELECT MAX(last_seen) FROM jobs").fetchone()[0] or "")
+        snapshot["last_seen"] = last_seen
+        parsed = _parse_datetime(last_seen)
+        snapshot["fresh_ts"] = parsed.timestamp() if parsed else 0.0
+        return snapshot
+    except sqlite3.Error:
+        return snapshot
+    finally:
+        conn.close()
+
+
+def _dashboard_source_label(repo_root: str, path: Path) -> str:
+    root = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
+    resolved = path.resolve()
+    public_export = (root / "public-export").resolve()
+    if resolved == (public_export / "state" / "gha-jobs.db").resolve():
+        return "public-export"
+    if root.name.lower() == "public-export" and resolved == (root / "state" / "gha-jobs.db").resolve():
+        return "public-export"
+    if resolved == (root / "state" / "gha-jobs.db").resolve():
+        return "local"
+    if "dashboard-merged-" in resolved.name:
+        return "merged"
+    return resolved.parent.name or "local"
+
+
+def _copy_db_file(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def _merge_jobs_into(base_path: Path, overlay_path: Path) -> None:
+    base = sqlite3.connect(str(base_path))
+    overlay = sqlite3.connect(str(overlay_path))
+    try:
+        base.row_factory = sqlite3.Row
+        overlay.row_factory = sqlite3.Row
+        columns = [str(row["name"]) for row in overlay.execute("PRAGMA table_info(jobs)").fetchall()]
+        if not columns:
+            return
+        column_sql = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
+        select_sql = f"SELECT {column_sql} FROM jobs"
+        upsert_sql = f"INSERT OR REPLACE INTO jobs ({column_sql}) VALUES ({placeholders})"
+        for row in overlay.execute(select_sql).fetchall():
+            existing = base.execute("SELECT last_seen FROM jobs WHERE key=?", (row["key"],)).fetchone()
+            if existing is None or str(row["last_seen"] or "") > str(existing["last_seen"] or ""):
+                base.execute(upsert_sql, tuple(row[col] for col in columns))
+        base.commit()
+    finally:
+        overlay.close()
+        base.close()
+
+
+def _select_dashboard_db(repo_root: str, db_path: str) -> tuple[Path, str]:
+    primary = _resolve_db_path(repo_root, db_path)
+    candidates = [_db_snapshot(primary)]
+    root = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
+    peer_paths: list[Path] = []
+    nested_public_export = (root / "public-export" / db_path).resolve()
+    if nested_public_export != primary:
+        peer_paths.append(nested_public_export)
+    if root.name.lower() == "public-export":
+        sibling_main = (root.parent / db_path).resolve()
+        if sibling_main != primary:
+            peer_paths.append(sibling_main)
+    for peer in peer_paths:
+        candidates.append(_db_snapshot(peer))
+
+    existing = [snap for snap in candidates if snap["exists"]]
+    if not existing:
+        return primary, "primary-missing"
+
+    by_path = {Path(snap["path"]): snap for snap in existing}
+    public_candidate = None
+    for path, snap in by_path.items():
+        if _dashboard_source_label(repo_root, path) == "public-export":
+            public_candidate = snap
+            break
+    local_candidate = None
+    for path, snap in by_path.items():
+        if _dashboard_source_label(repo_root, path) == "local":
+            local_candidate = snap
+            break
+
+    if public_candidate and local_candidate:
+        if int(public_candidate["recent_jobs_24h"]) > 0 and int(local_candidate["recent_jobs_24h"]) > 0:
+            best = public_candidate
+            other = local_candidate
+            suffix = f"{int(float(best['fresh_ts']))}-{int(float(other['fresh_ts']))}"
+            merged_name = f"dashboard-merged-{suffix}.db"
+            merged_path = (Path(repo_root) / "state" / merged_name).resolve() if repo_root else primary
+            _copy_db_file(Path(best["path"]), merged_path)
+            _merge_jobs_into(merged_path, Path(other["path"]))
+            return merged_path, "merged-public+local"
+        return Path(public_candidate["path"]), "public-truth"
+
+    if public_candidate:
+        return Path(public_candidate["path"]), "public-truth"
+
+    existing.sort(
+        key=lambda snap: (
+            float(snap["fresh_ts"]),
+            int(snap["recent_jobs_24h"]),
+            int(snap["total_jobs"]),
+        ),
+        reverse=True,
+    )
+    best = existing[0]
+    if len(existing) == 1:
+        return Path(best["path"]), "single"
+    other = existing[1]
+    if int(best["recent_jobs_24h"]) > 0 and int(other["recent_jobs_24h"]) > 0:
+        suffix = f"{int(float(best['fresh_ts']))}-{int(float(other['fresh_ts']))}"
+        merged_name = f"dashboard-merged-{suffix}.db"
+        merged_path = (Path(repo_root) / "state" / merged_name).resolve() if repo_root else primary
+        _copy_db_file(Path(best["path"]), merged_path)
+        _merge_jobs_into(merged_path, Path(other["path"]))
+        return merged_path, "merged"
+    return Path(best["path"]), "freshest"
 
 
 def _slug(text: str) -> str:
@@ -417,6 +569,15 @@ def serve_web(
     db_lock = threading.RLock()
     scan_lock = threading.Lock()
     last_repo_pull_monotonic = 0.0
+    active_dashboard_db_path = str(_resolve_db_path(repo_root, cfg.database.path))
+    active_dashboard_db_meta: dict[str, object] = {
+        "path": active_dashboard_db_path,
+        "strategy": "configured",
+        "source": _dashboard_source_label(repo_root, Path(active_dashboard_db_path)),
+        "last_seen": "",
+        "recent_jobs_24h": 0,
+        "total_jobs": 0,
+    }
     scan_state: dict[str, object] = {
         "running": False,
         "mode": "",
@@ -437,15 +598,30 @@ def serve_web(
             scan_state.update(updates)
 
     def _replace_dashboard_db() -> None:
-        nonlocal db
-        replacement = Database(cfg.database.path)
+        nonlocal db, active_dashboard_db_path, active_dashboard_db_meta
+        replacement_path, strategy = _select_dashboard_db(repo_root, cfg.database.path)
+        resolved_path = str(replacement_path)
+        snapshot = _db_snapshot(replacement_path)
+        active_dashboard_db_meta = {
+            "path": resolved_path,
+            "strategy": strategy,
+            "source": _dashboard_source_label(repo_root, replacement_path),
+            "last_seen": snapshot.get("last_seen", ""),
+            "recent_jobs_24h": snapshot.get("recent_jobs_24h", 0),
+            "total_jobs": snapshot.get("total_jobs", 0),
+        }
+        if resolved_path == active_dashboard_db_path:
+            return
+        replacement = Database(resolved_path)
         with db_lock:
             old_db = db
             db = replacement
+            active_dashboard_db_path = resolved_path
         try:
             old_db.close()
         except Exception:
             pass
+        log.info("Dashboard DB switched to %s (%s).", resolved_path, strategy)
 
     def _maybe_pull_repo() -> None:
         nonlocal last_repo_pull_monotonic
@@ -488,6 +664,7 @@ def serve_web(
             log.warning("Dashboard auto-pull failed: %s", output or f"git exited with {pull.returncode}")
             return
         if "Already up to date." in output or "Already up-to-date." in output:
+            _replace_dashboard_db()
             return
         log.info("Dashboard auto-pull refreshed repo state.")
         _replace_dashboard_db()
@@ -848,6 +1025,13 @@ def serve_web(
             boards_cursor = int(db.get_cursor("boards_main") or 0)
         except Exception:
             boards_cursor = 0
+        db_meta = dict(active_dashboard_db_meta)
+        db_source = escape(str(db_meta.get("source") or "local"))
+        db_strategy = escape(str(db_meta.get("strategy") or "configured"))
+        db_path_label = escape(str(db_meta.get("path") or ""))
+        db_last_seen = escape(str(db_meta.get("last_seen") or "unknown"))
+        db_recent_jobs = int(db_meta.get("recent_jobs_24h") or 0)
+        db_total_jobs = int(db_meta.get("total_jobs") or 0)
         shown_yes = sum(1 for job in jobs if (job.get("label") or "").strip().lower() == "yes")
         shown_maybe = sum(1 for job in jobs if (job.get("label") or "").strip().lower() == "maybe")
         shown_no = sum(1 for job in jobs if (job.get("label") or "").strip().lower() == "no")
@@ -873,6 +1057,9 @@ def serve_web(
             "<div>"
             "<h1>Job Review Board</h1>"
             "<p class=\"muted\">Review fresh roles, update your pipeline quickly, and run scans without leaving the page.</p>"
+            f"<p class=\"muted\">Dashboard data source: <strong>{db_source}</strong> | strategy: <strong>{db_strategy}</strong></p>"
+            f"<p class=\"muted\">Active DB: <code>{db_path_label}</code></p>"
+            f"<p class=\"muted\">DB freshness: last seen <strong>{db_last_seen}</strong> | recent jobs (24h): <strong>{db_recent_jobs}</strong> | total stored: <strong>{db_total_jobs}</strong></p>"
             "<ul class=\"helper-list\">"
             "<li><strong>Scan Main Sources</strong> is the fastest local refresh for direct high-priority companies.</li>"
             "<li><strong>Scan Next Board Batch</strong> is the recommended local board action when you just want a quick incremental update.</li>"
@@ -1431,6 +1618,7 @@ def serve_web(
         method = environ.get("REQUEST_METHOD", "GET").upper()
         query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
         if method == "GET":
+            _replace_dashboard_db()
             _maybe_pull_repo()
 
         def _redirect_home(form: dict[str, str | list[str]] | None = None, *, message: str = ""):
@@ -1640,6 +1828,8 @@ def serve_web(
 
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
         return [b"Not found."]
+
+    _replace_dashboard_db()
 
     with make_server(host, port, app) as httpd:
         print(f"Job Radar web UI running at http://{host}:{port}")
