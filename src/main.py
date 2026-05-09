@@ -504,7 +504,12 @@ def run_priority(
                 " ".join(f"{p}={c}" for p, c in sorted(platform_counts.items())),
             )
             board_jobs, board_errors, board_records = _process_boards_batch(
-                boards, db, timeout, workers, progress_callback=None
+                boards,
+                db,
+                timeout,
+                workers,
+                cfg.boards.rescan_cooldown_hours,
+                progress_callback=None,
             )
             all_jobs.extend(board_jobs)
             errors.extend(board_errors)
