@@ -22,6 +22,7 @@ from .config import Config
 from .database import Database
 from .evaluation import evaluate_job
 from .job_intelligence import extract_workday_req_id
+from .scoring_policy import calibrate_thresholds
 from .resume_builder import generate_resume_packet
 from .sources.base import is_us_location
 
@@ -31,7 +32,10 @@ PIPELINE_STATUSES = [
     "resume_generated",
     "applied",
     "interview",
+    "onsite",
     "offer",
+    "screen_reject",
+    "ghosted",
     "rejected",
     "archived",
 ]
@@ -309,9 +313,9 @@ def _queue_match(job: dict, queue: str, status: str) -> bool:
     if queue == "all":
         return True
     if queue == "active":
-        return pipeline_status not in {"archived", "rejected"}
+        return pipeline_status not in {"archived", "rejected", "screen_reject", "ghosted"}
     if queue == "actionable":
-        return pipeline_status in {"new", "shortlisted", "resume_generated", "applied", "interview"}
+        return pipeline_status in {"new", "shortlisted", "resume_generated", "applied", "interview", "onsite"}
     return True
 
 
@@ -801,6 +805,9 @@ def serve_web(
     def _flags() -> dict[str, bool]:
         return db.get_feature_flags(defaults)
 
+    def _label_thresholds():
+        return calibrate_thresholds(db.get_feedback_jobs())
+
     def _persist_evaluation(job: dict) -> tuple[dict, object]:
         db.refresh_job_intelligence(
             key=job["key"],
@@ -812,6 +819,7 @@ def serve_web(
             description=job.get("description", ""),
         )
         job = db.get_job(job["key"]) or job
+        thresholds = _label_thresholds()
         evaluation = evaluate_job(
             job["title"],
             job.get("description", ""),
@@ -819,6 +827,8 @@ def serve_web(
             location=job["location"],
             source=job.get("source", ""),
             require_us_location=cfg.filter.require_us_location,
+            yes_threshold=thresholds.yes,
+            maybe_threshold=thresholds.maybe,
         )
         current_json = job.get("evaluation_json") or ""
         if (
@@ -897,6 +907,7 @@ def serve_web(
                 description=job.get("description", ""),
             )
             refreshed = db.get_job(job["key"]) or job
+            thresholds = _label_thresholds()
             evaluation = evaluate_job(
                 refreshed["title"],
                 refreshed.get("description", ""),
@@ -904,6 +915,8 @@ def serve_web(
                 location=refreshed["location"],
                 source=refreshed.get("source", ""),
                 require_us_location=cfg.filter.require_us_location,
+                yes_threshold=thresholds.yes,
+                maybe_threshold=thresholds.maybe,
             )
             db.update_job_evaluation(
                 key=job["key"],
@@ -1215,8 +1228,12 @@ def serve_web(
             ("security_clearance", "Security Clearance"),
             ("employment_type", "Employment Type"),
             ("resume_match_score", "Resume/JD Match"),
+            ("resume_match_cap", "Resume/JD Cap"),
+            ("resume_match_cap_reason", "Resume/JD Cap Reason"),
             ("company_priority_delta", "Company Priority Delta"),
             ("company_priority_reason", "Company Priority Reason"),
+            ("label_threshold_yes", "Yes Threshold"),
+            ("label_threshold_maybe", "Maybe Threshold"),
             ("feedback_score_delta", "Feedback Score Delta"),
             ("feedback_reasons", "Feedback Reasons"),
         ):
@@ -1728,6 +1745,7 @@ def serve_web(
             flags = _flags()
             if not flags.get("resume_generation", True):
                 return _redirect(start_response, f"/job?key={quote(key, safe='')}")
+            thresholds = _label_thresholds()
             evaluation = evaluate_job(
                 job["title"],
                 job.get("description", ""),
@@ -1735,6 +1753,8 @@ def serve_web(
                 location=job["location"],
                 source=job.get("source", ""),
                 require_us_location=cfg.filter.require_us_location,
+                yes_threshold=thresholds.yes,
+                maybe_threshold=thresholds.maybe,
             )
             packet = generate_resume_packet(job, evaluation)
             resume_id = db.save_generated_resume(
@@ -1779,6 +1799,7 @@ def serve_web(
             company = form.get("company", "").strip() or "Manual Entry"
             location = form.get("location", "").strip() or "Unknown Location"
             url = form.get("url", "").strip() or f"manual://{_slug(company)}"
+            thresholds = _label_thresholds()
             evaluation = evaluate_job(
                 title,
                 description,
@@ -1786,6 +1807,8 @@ def serve_web(
                 location=location,
                 source="manual",
                 require_us_location=cfg.filter.require_us_location,
+                yes_threshold=thresholds.yes,
+                maybe_threshold=thresholds.maybe,
             )
             digest = hashlib.sha1(f"{company.lower()}|{title.lower()}|{description[:240]}".encode("utf-8")).hexdigest()[:12]
             manual_key = f"manual:{_slug(company)}:{_slug(title)}:{digest}"

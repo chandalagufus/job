@@ -36,6 +36,7 @@ from .evaluation import evaluate_job
 from .feedback_scorer import build_feedback_adjustments
 from .job_intelligence import to_structured_json
 from .notifier import CompositeNotifier, EmailNotifier, SlackNotifier, DiscordNotifier
+from .scoring_policy import calibrate_thresholds, label_for_score, resume_fit_cap
 from .sources.base import Job, is_us_location
 from .sources.eightfold import EightfoldSource
 from .sources.amazon import AmazonSource
@@ -318,7 +319,12 @@ def _dedup_jobs(jobs: list[Job]) -> list[Job]:
 def _load_structured_json(raw: str) -> dict:
     text = (raw or "").strip()
     if not text:
-    return {}
+        return {}
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _dimension_score(evaluation, name: str) -> int:
@@ -332,11 +338,10 @@ def _resume_match_score(evaluation) -> int:
     evidence = _dimension_score(evaluation, "evidence_quality")
     overlap = _dimension_score(evaluation, "skill_overlap")
     return max(0, min(100, round(0.6 * evidence + 0.4 * overlap)))
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+
+
+def _relabel(score: int, thresholds) -> str:
+    return label_for_score(score, yes_threshold=thresholds.yes, maybe_threshold=thresholds.maybe)
 
 
 # ---------------------------------------------------------------------------
@@ -1043,10 +1048,22 @@ def _dispatch_results(
     if dupes:
         log.info("Dedup: removed %d duplicate(s)", dupes)
 
+    feedback_rows = db.get_feedback_jobs()
+    thresholds = calibrate_thresholds(feedback_rows)
+    if thresholds.calibrated:
+        log.info(
+            "Outcome-calibrated thresholds: yes>=%d maybe>=%d (%d positive / %d negative feedback rows).",
+            thresholds.yes,
+            thresholds.maybe,
+            thresholds.positive_count,
+            thresholds.negative_count,
+        )
+
     # Structured evaluation + company priority/exclusion
     filtered_matched: list[Job] = []
     company_excluded = 0
     company_boosted = 0
+    resume_capped = 0
     for j in matched:
         evaluation = evaluate_job(
             j.title,
@@ -1055,6 +1072,8 @@ def _dispatch_results(
             location=j.location,
             source=j.source,
             require_us_location=cfg.filter.require_us_location,
+            yes_threshold=thresholds.yes,
+            maybe_threshold=thresholds.maybe,
         )
         j.score = evaluation.score
         j.label = evaluation.label
@@ -1077,15 +1096,19 @@ def _dispatch_results(
         if company_delta > 0:
             company_boosted += 1
             j.score = min(100, j.score + company_delta)
-            if j.score >= 70:
-                j.label = "yes"
-            elif j.score >= 40:
-                j.label = "maybe"
-            else:
-                j.label = "no"
+            j.label = _relabel(j.score, thresholds)
+        resume_cap, resume_cap_reason = resume_fit_cap(resume_match_score)
+        if j.score > resume_cap:
+            resume_capped += 1
+            j.score = resume_cap
+            j.label = _relabel(j.score, thresholds)
         merged_structured["resume_match_score"] = resume_match_score
+        merged_structured["resume_match_cap"] = resume_cap
+        merged_structured["resume_match_cap_reason"] = resume_cap_reason
         merged_structured["company_priority_delta"] = company_delta
         merged_structured["company_priority_reason"] = company_reason
+        merged_structured["label_threshold_yes"] = thresholds.yes
+        merged_structured["label_threshold_maybe"] = thresholds.maybe
         j.structured_json = to_structured_json(merged_structured)
         j.is_repost = intelligence["is_repost"]
         j.repost_of_key = intelligence["repost_of_key"]
@@ -1099,9 +1122,12 @@ def _dispatch_results(
         log.info("Company filter: excluded %d job(s) by employer rule.", company_excluded)
     if company_boosted:
         log.info("Company priority: boosted %d job(s).", company_boosted)
+    if resume_capped:
+        log.info("Resume fit cap: capped %d job(s) after boosts.", resume_capped)
 
-    feedback_adjustments = build_feedback_adjustments(matched, db.get_feedback_jobs())
+    feedback_adjustments = build_feedback_adjustments(matched, feedback_rows)
     feedback_adjusted = 0
+    feedback_capped = 0
     for j in matched:
         adjustment = feedback_adjustments.get(j.key)
         if adjustment is None:
@@ -1109,19 +1135,20 @@ def _dispatch_results(
         if adjustment.delta:
             feedback_adjusted += 1
             j.score = max(0, min(100, j.score + adjustment.delta))
-            if j.score >= 70:
-                j.label = "yes"
-            elif j.score >= 40:
-                j.label = "maybe"
-            else:
-                j.label = "no"
         merged_structured = _load_structured_json(getattr(j, "structured_json", ""))
+        resume_cap = int(merged_structured.get("resume_match_cap") or 100)
+        if j.score > resume_cap:
+            feedback_capped += 1
+            j.score = resume_cap
+        j.label = _relabel(j.score, thresholds)
         merged_structured["feedback_score_delta"] = adjustment.delta
         merged_structured["feedback_reasons"] = adjustment.reasons
         j.structured_json = to_structured_json(merged_structured)
 
     if feedback_adjusted:
         log.info("Feedback rescoring: adjusted %d job(s) using recorded user actions.", feedback_adjusted)
+    if feedback_capped:
+        log.info("Resume fit cap: held back %d job(s) after feedback adjustments.", feedback_capped)
 
     yes_jobs = sorted([j for j in matched if j.label == "yes"], key=lambda j: j.score, reverse=True)
     maybe_jobs = sorted([j for j in matched if j.label == "maybe"], key=lambda j: j.score, reverse=True)
@@ -1186,6 +1213,8 @@ def _dispatch_results(
                 location=j.location,
                 source=j.source,
                 require_us_location=cfg.filter.require_us_location,
+                yes_threshold=thresholds.yes,
+                maybe_threshold=thresholds.maybe,
             )
             db.mark_job_seen(
                 key=j.key, source=j.source, company=j.company, title=j.title,

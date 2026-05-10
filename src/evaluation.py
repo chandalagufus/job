@@ -17,6 +17,7 @@ from .classifier import (
 )
 from .config import Config
 from .profile import PROFILE, SKILLS_MODERATE, SKILLS_STRONG
+from .scoring_policy import DEFAULT_MAYBE_THRESHOLD, DEFAULT_YES_THRESHOLD, label_for_score
 from .sources.base import is_us_location
 
 EVAL_CFG = Config.load()
@@ -262,12 +263,8 @@ def _target_role_hits(text: str) -> list[str]:
     return hits
 
 
-def _score_to_label(score: int) -> str:
-    if score >= 70:
-        return "yes"
-    if score >= 40:
-        return "maybe"
-    return "no"
+def _score_to_label(score: int, *, yes_threshold: int = DEFAULT_YES_THRESHOLD, maybe_threshold: int = DEFAULT_MAYBE_THRESHOLD) -> str:
+    return label_for_score(score, yes_threshold=yes_threshold, maybe_threshold=maybe_threshold)
 
 
 def _score_to_grade(score: int) -> str:
@@ -433,6 +430,24 @@ def _dimension_location(location: str, text: str) -> tuple[int, str]:
     return 40, "Location information is weak or missing."
 
 
+def _onsite_mismatch_cap(location: str, text: str) -> tuple[int, str]:
+    loc = (location or "").lower()
+    body = (text or "").lower()
+    remote_like = any(token in loc or token in body for token in ("remote", "hybrid"))
+    onsite_like = any(token in loc or token in body for token in ("onsite", "on-site", "in office", "in-office"))
+    if remote_like or not onsite_like:
+        return 100, ""
+
+    preferred_locations = [str(item).lower() for item in PROFILE.get("preferred_locations", []) if item]
+    preferred_tokens: set[str] = set()
+    for item in preferred_locations:
+        preferred_tokens.update(part.strip() for part in re.split(r"[,/]", item) if part.strip())
+
+    if any(token and token in loc for token in preferred_tokens):
+        return 100, ""
+    return 58, f"Capped because this looks like an onsite role outside your preferred markets: {location or 'unknown location'}."
+
+
 def _dimension_evidence(
     description: str,
     matched_strong: list[str],
@@ -496,6 +511,8 @@ def evaluate_job(
     location: str = "",
     source: str = "",
     require_us_location: bool | None = None,
+    yes_threshold: int = DEFAULT_YES_THRESHOLD,
+    maybe_threshold: int = DEFAULT_MAYBE_THRESHOLD,
 ) -> EvaluationResult:
     if require_us_location is None:
         require_us_location = EVAL_CFG.filter.require_us_location
@@ -619,11 +636,13 @@ def evaluate_job(
     score = round(sum(d.weighted_points for d in dimensions) - experience_penalty)
     evidence_cap, evidence_cap_reason = _evidence_score_cap(description, source)
     resume_cap, resume_cap_reason = _resume_gap_score_cap(assessment)
+    onsite_cap, onsite_cap_reason = _onsite_mismatch_cap(location, text)
     score = min(score, evidence_cap)
     score = min(score, resume_cap)
+    score = min(score, onsite_cap)
     score = max(0, min(score, 100))
     grade = _score_to_grade(score)
-    label = _score_to_label(score)
+    label = _score_to_label(score, yes_threshold=yes_threshold, maybe_threshold=maybe_threshold)
 
     ordered = sorted(dimensions, key=lambda d: d.weighted_points, reverse=True)
     reasons = [d.reason for d in ordered[:4]]
@@ -633,6 +652,8 @@ def evaluate_job(
         reasons.insert(0, evidence_cap_reason)
     if resume_cap_reason and resume_cap_reason not in reasons:
         reasons.insert(0, resume_cap_reason)
+    if onsite_cap_reason and onsite_cap_reason not in reasons:
+        reasons.insert(0, onsite_cap_reason)
     reasons = reasons[:4]
     fit_summary = f"Grade {grade} ({score}/100). " + " ".join(reasons[:3])
 
