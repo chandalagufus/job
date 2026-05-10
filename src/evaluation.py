@@ -76,6 +76,14 @@ JD_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
         "requirements",
         "basic qualifications",
         "what you bring",
+        "what you'll bring",
+        "what youâ€™ll bring",
+        "what we're looking for",
+        "what weâ€™re looking for",
+        "your expertise",
+        "about you",
+        "you have",
+        "who you are",
         "must have",
     ),
     "preferred": (
@@ -209,8 +217,11 @@ def _find_jd_headings(description: str) -> list[tuple[int, int, str]]:
     headings: list[tuple[int, int, str]] = []
     for section, aliases in JD_SECTION_ALIASES.items():
         for alias in aliases:
-            pattern = re.compile(rf"(?im)^[#\-\*\s]*{re.escape(alias)}\s*:?\s*$")
-            for match in pattern.finditer(text):
+            standalone_pattern = re.compile(rf"(?im)^[#\-\*\s]*{re.escape(alias)}\s*:?\s*$")
+            inline_pattern = re.compile(rf"(?im)^[#\-\*\s]*{re.escape(alias)}\s*:\s*(?=\S)")
+            for match in standalone_pattern.finditer(text):
+                headings.append((match.start(), match.end(), section))
+            for match in inline_pattern.finditer(text):
                 headings.append((match.start(), match.end(), section))
     headings.sort(key=lambda item: item[0])
     deduped: list[tuple[int, int, str]] = []

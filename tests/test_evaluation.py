@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from src.evaluation import evaluate_job
+from src.evaluation import _jd_sections, evaluate_job
 
 
 class EvaluationEvidenceTests(unittest.TestCase):
@@ -30,6 +30,105 @@ class EvaluationEvidenceTests(unittest.TestCase):
         self.assertIn("java", result.critical_skill_gaps)
         self.assertLessEqual(result.score, 72)
         self.assertTrue(any("java" in reason.lower() for reason in result.reasons))
+
+    def test_plain_text_jd_without_headings_still_scores_from_general_text(self) -> None:
+        jd = (
+            "Data Scientist role focused on python, sql, experimentation, product analytics, "
+            "and stakeholder reporting for growth teams."
+        )
+        evidence = (
+            "Built python and sql analytics workflows. Designed experimentation readouts and "
+            "product analytics dashboards for growth stakeholders."
+        )
+
+        with patch("src.evaluation._resume_evidence_text", return_value=evidence):
+            result = evaluate_job(
+                "Data Scientist",
+                jd,
+                company="Example",
+                location="Remote, United States",
+                source="linkedin",
+                require_us_location=False,
+            )
+
+        self.assertGreaterEqual(result.score, 60)
+        self.assertNotIn("python", result.critical_skill_gaps)
+
+    def test_preferred_skill_gap_does_not_become_critical(self) -> None:
+        jd = (
+            "Required Qualifications\n"
+            "- Python\n"
+            "- SQL\n\n"
+            "Preferred Qualifications\n"
+            "- Kubernetes\n"
+        )
+        evidence = "Built Python and SQL pipelines for analytics reporting."
+
+        with patch("src.evaluation._resume_evidence_text", return_value=evidence):
+            result = evaluate_job(
+                "Data Engineer",
+                jd,
+                company="Example",
+                location="Austin, TX",
+                source="google",
+                require_us_location=False,
+            )
+
+        self.assertIn("kubernetes", result.unsupported_strong)
+        self.assertNotIn("kubernetes", result.critical_skill_gaps)
+
+    def test_responsibility_skill_gap_uses_middle_tier_penalty(self) -> None:
+        jd = (
+            "What You'll Do\n"
+            "- Build Kafka streaming workflows and python services.\n\n"
+            "Minimum Qualifications\n"
+            "- Python\n"
+        )
+        evidence = "Built Python services and analytics APIs."
+
+        with patch("src.evaluation._resume_evidence_text", return_value=evidence):
+            result = evaluate_job(
+                "Data Engineer",
+                jd,
+                company="Example",
+                location="Remote, United States",
+                source="google",
+                require_us_location=False,
+            )
+
+        self.assertNotIn("kafka", result.critical_skill_gaps)
+        self.assertTrue(any("core jd responsibilities" in reason.lower() for reason in result.reasons))
+        self.assertLessEqual(result.score, 80)
+
+    def test_nonstandard_required_alias_maps_to_required_bucket(self) -> None:
+        jd = (
+            "Your Expertise\n"
+            "- Strong experience with Java and SQL\n"
+        )
+        evidence = "Built SQL reporting workflows and python data pipelines."
+
+        with patch("src.evaluation._resume_evidence_text", return_value=evidence):
+            result = evaluate_job(
+                "Data Engineer",
+                jd,
+                company="Example",
+                location="New York, NY",
+                source="google",
+                require_us_location=False,
+            )
+
+        self.assertIn("java", result.critical_skill_gaps)
+
+    def test_inline_required_heading_is_parsed(self) -> None:
+        jd = (
+            "Required Qualifications: Python, SQL, Java\n"
+            "Preferred Qualifications: Tableau\n"
+        )
+
+        sections = _jd_sections(jd)
+
+        self.assertIn("python", sections.get("required", "").lower())
+        self.assertIn("tableau", sections.get("preferred", "").lower())
 
 
 if __name__ == "__main__":
