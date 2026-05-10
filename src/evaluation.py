@@ -22,6 +22,8 @@ from .sources.base import is_us_location, remote_scope_status
 
 EVAL_CFG = Config.load()
 ROOT_DIR = Path(__file__).resolve().parents[1]
+LOCAL_CANDIDATE_EVIDENCE_PATH = ROOT_DIR / "data" / "resume" / "candidate_evidence.local.md"
+CANDIDATE_EVIDENCE_PATH = ROOT_DIR / "data" / "resume" / "candidate_evidence.md"
 LOCAL_BASE_RESUME_PATH = ROOT_DIR / "data" / "resume" / "base_resume.local.md"
 BASE_RESUME_PATH = ROOT_DIR / "data" / "resume" / "base_resume.md"
 STRONG_DIRECT_SOURCES = frozenset({
@@ -64,6 +66,56 @@ SKILL_EVIDENCE_ALIASES: dict[str, tuple[str, ...]] = {
     "pyspark": ("pyspark", "spark", "apache spark"),
     "rest api": ("rest api", "rest apis", "api", "apis"),
     "spark": ("spark", "pyspark", "apache spark"),
+}
+JD_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
+    "required": (
+        "minimum qualifications",
+        "minimum qualification",
+        "required qualifications",
+        "required qualification",
+        "requirements",
+        "basic qualifications",
+        "what you bring",
+        "must have",
+    ),
+    "preferred": (
+        "preferred qualifications",
+        "preferred qualification",
+        "nice to have",
+        "nice-to-have",
+        "bonus points",
+        "bonus",
+        "preferred skills",
+    ),
+    "responsibilities": (
+        "responsibilities",
+        "what you'll do",
+        "what you will do",
+        "what you’ll do",
+        "in this role",
+        "role summary",
+        "day to day",
+        "typical week",
+    ),
+    "company": (
+        "about us",
+        "about the company",
+        "who we are",
+        "company overview",
+    ),
+    "benefits": (
+        "benefits",
+        "perks",
+        "compensation",
+        "what we offer",
+    ),
+}
+TARGET_ROLE_ALIASES: dict[str, tuple[str, ...]] = {
+    "Business Intelligence Analyst": ("business intelligence analyst", "bi analyst"),
+    "Business Intelligence Developer": ("business intelligence developer", "bi developer"),
+    "Machine Learning Engineer": ("machine learning engineer", "mle"),
+    "Data Scientist": ("data scientist", "ds"),
+    "AI Engineer": ("ai engineer", "genai engineer", "generative ai engineer"),
 }
 
 
@@ -128,7 +180,12 @@ def _phrase_match(text: str, phrase: str) -> bool:
 
 @lru_cache(maxsize=1)
 def _resume_evidence_text() -> str:
-    for path in (LOCAL_BASE_RESUME_PATH, BASE_RESUME_PATH):
+    for path in (
+        LOCAL_CANDIDATE_EVIDENCE_PATH,
+        CANDIDATE_EVIDENCE_PATH,
+        LOCAL_BASE_RESUME_PATH,
+        BASE_RESUME_PATH,
+    ):
         try:
             markdown = path.read_text(encoding="utf-8")
         except OSError:
@@ -147,6 +204,43 @@ def _resume_evidence_text() -> str:
     return ""
 
 
+def _find_jd_headings(description: str) -> list[tuple[int, int, str]]:
+    text = description or ""
+    headings: list[tuple[int, int, str]] = []
+    for section, aliases in JD_SECTION_ALIASES.items():
+        for alias in aliases:
+            pattern = re.compile(rf"(?im)^[#\-\*\s]*{re.escape(alias)}\s*:?\s*$")
+            for match in pattern.finditer(text):
+                headings.append((match.start(), match.end(), section))
+    headings.sort(key=lambda item: item[0])
+    deduped: list[tuple[int, int, str]] = []
+    seen_positions: set[tuple[int, str]] = set()
+    for start, end, section in headings:
+        key = (start, section)
+        if key in seen_positions:
+            continue
+        seen_positions.add(key)
+        deduped.append((start, end, section))
+    return deduped
+
+
+@lru_cache(maxsize=256)
+def _jd_sections(description: str) -> dict[str, str]:
+    text = description or ""
+    sections: dict[str, list[str]] = {name: [] for name in JD_SECTION_ALIASES}
+    headings = _find_jd_headings(text)
+    if not headings:
+        return {"full_text": text}
+    for idx, (_start, end, section) in enumerate(headings):
+        next_start = headings[idx + 1][0] if idx + 1 < len(headings) else len(text)
+        body = text[end:next_start].strip()
+        if body:
+            sections.setdefault(section, []).append(body)
+    output = {name: "\n".join(parts).strip() for name, parts in sections.items() if parts}
+    output["full_text"] = text
+    return output
+
+
 def _skill_aliases(skill: str) -> tuple[str, ...]:
     aliases = SKILL_EVIDENCE_ALIASES.get(skill, ())
     if skill not in aliases:
@@ -160,18 +254,30 @@ def _has_resume_evidence(skill: str, evidence_text: str) -> bool:
     return any(_phrase_match(evidence_text, alias) for alias in _skill_aliases(skill))
 
 
-def _is_critical_skill_requirement(skill: str, description: str) -> bool:
-    raw_text = f" {re.sub(r'[^a-z0-9]+', ' ', (description or '').lower())} "
-    if not any(_phrase_match(raw_text, alias) for alias in _skill_aliases(skill)):
-        return False
-    for sentence in re.split(r"[.\n]+", raw_text):
+def _skill_requirement_level(skill: str, description: str) -> str:
+    sections = _jd_sections(description)
+    required_text = _norm(sections.get("required", ""))
+    preferred_text = _norm(sections.get("preferred", ""))
+    responsibilities_text = _norm(sections.get("responsibilities", ""))
+    full_text = _norm(sections.get("full_text", ""))
+    aliases = _skill_aliases(skill)
+
+    if required_text and any(_phrase_match(required_text, alias) for alias in aliases):
+        return "required"
+    if responsibilities_text and any(_phrase_match(responsibilities_text, alias) for alias in aliases):
+        return "responsibility"
+    if preferred_text and any(_phrase_match(preferred_text, alias) for alias in aliases):
+        return "preferred"
+    if not any(_phrase_match(full_text, alias) for alias in aliases):
+        return ""
+    for sentence in re.split(r"[.\n]+", full_text):
         if not sentence.strip():
             continue
-        if not any(_phrase_match(sentence, alias) for alias in _skill_aliases(skill)):
+        if not any(_phrase_match(sentence, alias) for alias in aliases):
             continue
         if any(hint in sentence for hint in CRITICAL_SKILL_HINTS):
-            return True
-    return False
+            return "required"
+    return "mentioned"
 
 
 @dataclass
@@ -181,6 +287,7 @@ class SkillEvidenceAssessment:
     unsupported_strong: list[str]
     unsupported_moderate: list[str]
     critical_skill_gaps: list[str]
+    responsibility_skill_gaps: list[str]
     supported_strong_points: int
     supported_moderate_points: int
 
@@ -198,6 +305,7 @@ def _assess_skill_evidence(
     unsupported_strong: list[str] = []
     unsupported_moderate: list[str] = []
     critical_skill_gaps: list[str] = []
+    responsibility_skill_gaps: list[str] = []
     supported_strong_points = 0
     supported_moderate_points = 0
 
@@ -207,8 +315,11 @@ def _assess_skill_evidence(
             supported_strong_points += 18 if _phrase_match(title_text, skill) else 12
         else:
             unsupported_strong.append(skill)
-            if _is_critical_skill_requirement(skill, description):
+            requirement_level = _skill_requirement_level(skill, description)
+            if requirement_level == "required":
                 critical_skill_gaps.append(skill)
+            elif requirement_level == "responsibility":
+                responsibility_skill_gaps.append(skill)
 
     for skill in matched_moderate:
         if _has_resume_evidence(skill, evidence_text):
@@ -216,8 +327,11 @@ def _assess_skill_evidence(
             supported_moderate_points += 8 if _phrase_match(title_text, skill) else 5
         else:
             unsupported_moderate.append(skill)
-            if _is_critical_skill_requirement(skill, description):
+            requirement_level = _skill_requirement_level(skill, description)
+            if requirement_level == "required":
                 critical_skill_gaps.append(skill)
+            elif requirement_level == "responsibility":
+                responsibility_skill_gaps.append(skill)
 
     return SkillEvidenceAssessment(
         supported_strong=supported_strong,
@@ -225,6 +339,7 @@ def _assess_skill_evidence(
         unsupported_strong=unsupported_strong,
         unsupported_moderate=unsupported_moderate,
         critical_skill_gaps=critical_skill_gaps,
+        responsibility_skill_gaps=responsibility_skill_gaps,
         supported_strong_points=supported_strong_points,
         supported_moderate_points=supported_moderate_points,
     )
@@ -257,8 +372,10 @@ def _match_skills(title: str, description: str) -> tuple[list[str], list[str], i
 
 def _target_role_hits(text: str) -> list[str]:
     hits: list[str] = []
+    normalized_text = _norm(text)
     for role in PROFILE.get("target_roles", []):
-        if role.lower() in text:
+        aliases = TARGET_ROLE_ALIASES.get(role, (role,))
+        if any(_phrase_match(normalized_text, alias) for alias in aliases):
             hits.append(role)
     return hits
 
@@ -355,14 +472,20 @@ def _dimension_skill_overlap(
     if assessment.critical_skill_gaps:
         score = max(35, min(raw_score - 28, supported_score + 18))
         return score, (
-            "Keyword overlap exists, but JD-critical skills are not backed by resume bullets/projects: "
+            "Keyword overlap exists, but JD-critical skills are not backed by experience/project evidence: "
             f"{', '.join(assessment.critical_skill_gaps[:4])}."
+        )
+    if assessment.responsibility_skill_gaps:
+        score = max(45, min(raw_score - 16, supported_score + 20))
+        return score, (
+            "Core JD responsibilities mention skills that are not strongly evidenced in your work/projects: "
+            f"{', '.join(assessment.responsibility_skill_gaps[:4])}."
         )
     if assessment.unsupported_strong or assessment.unsupported_moderate:
         score = max(40, min(raw_score - 12, supported_score + 22))
         unsupported = assessment.unsupported_strong + assessment.unsupported_moderate
         return score, (
-            "Some overlap is only declared in the skills list and not evidenced in work/projects: "
+            "Some overlap is only declared in the skills list and not evidenced in experience/projects: "
             f"{', '.join(unsupported[:4])}."
         )
     if matched_strong:
@@ -479,6 +602,11 @@ def _dimension_evidence(
             "The JD is detailed, but important requirements are not verified in experience/project evidence: "
             f"{', '.join(assessment.critical_skill_gaps[:4])}."
         )
+    if assessment.responsibility_skill_gaps:
+        return 48, (
+            "The JD responsibilities are clear, but some core execution skills are not backed by experience/project evidence: "
+            f"{', '.join(assessment.responsibility_skill_gaps[:4])}."
+        )
     if assessment.unsupported_strong:
         return 52, (
             "The JD has overlap, but some strong-skill matches are only declared and not demonstrated: "
@@ -507,6 +635,11 @@ def _resume_gap_score_cap(assessment: SkillEvidenceAssessment) -> tuple[int, str
         return 72, (
             "Capped because at least one JD-critical skill is not backed by resume experience or project evidence: "
             f"{', '.join(assessment.critical_skill_gaps[:4])}."
+        )
+    if assessment.responsibility_skill_gaps:
+        return 80, (
+            "Capped because some core JD responsibility skills are not yet backed by resume experience or project evidence: "
+            f"{', '.join(assessment.responsibility_skill_gaps[:4])}."
         )
     if len(assessment.unsupported_strong) >= 3:
         return 84, (
