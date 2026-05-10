@@ -109,7 +109,6 @@ DATA_STRONG = [
 # ---------------------------------------------------------------------------
 DATA_WEAK = [
     "analytics",
-    "data",
     "intelligence",
     "insights",
     "tableau",
@@ -206,6 +205,15 @@ HARD_EXCLUDES = [
     "systems administrator",
     "sysadmin",
     "database administrator",
+    "data entry",
+    "data center",
+    "accounts payable",
+    "billing analyst",
+    "claims analyst",
+    "procurement analyst",
+    "inventory analyst",
+    "legal analyst",
+    "compliance analyst",
     # Hardware / non-software
     "hardware engineer",
     "electrical engineer",

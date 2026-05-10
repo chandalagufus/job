@@ -7,9 +7,10 @@ DEFAULT_YES_THRESHOLD = 70
 DEFAULT_MAYBE_THRESHOLD = 40
 MIN_THRESHOLD_FEEDBACK_ROWS = 8
 
+PREFERENCE_ACTIONS = frozenset({"interested", "applied", "dismissed", "archived", "shortlisted"})
+OUTCOME_POSITIVE_ACTIONS = frozenset({"responded", "interview", "onsite", "offer"})
+OUTCOME_NEGATIVE_ACTIONS = frozenset({"screen_reject", "rejected", "ghosted"})
 STRONG_POSITIVE_ACTIONS = frozenset({"interview", "onsite", "offer"})
-POSITIVE_ACTIONS = frozenset({"applied", "interested", "interview", "offer", "responded", "shortlisted", "onsite"})
-NEGATIVE_ACTIONS = frozenset({"dismissed", "rejected", "archived", "screen_reject", "ghosted"})
 
 
 @dataclass(frozen=True)
@@ -42,12 +43,12 @@ def calibrate_thresholds(feedback_rows: list[dict]) -> LabelThresholds:
             score = int(row.get("score") or 0)
         except (TypeError, ValueError):
             continue
-        if action not in POSITIVE_ACTIONS | NEGATIVE_ACTIONS:
+        if action not in OUTCOME_POSITIVE_ACTIONS | OUTCOME_NEGATIVE_ACTIONS:
             continue
         scored_rows.append((action, score))
 
-    positives = [score for action, score in scored_rows if action in POSITIVE_ACTIONS]
-    negatives = [score for action, score in scored_rows if action in NEGATIVE_ACTIONS]
+    positives = [score for action, score in scored_rows if action in OUTCOME_POSITIVE_ACTIONS]
+    negatives = [score for action, score in scored_rows if action in OUTCOME_NEGATIVE_ACTIONS]
     strong_positives = [score for action, score in scored_rows if action in STRONG_POSITIVE_ACTIONS]
 
     if len(scored_rows) < MIN_THRESHOLD_FEEDBACK_ROWS or len(positives) < 3 or len(negatives) < 3:

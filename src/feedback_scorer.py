@@ -5,19 +5,14 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 
+PREFERENCE_ACTIONS = frozenset({"interested", "shortlisted", "applied", "dismissed", "archived"})
+OUTCOME_ACTIONS = frozenset({"responded", "interview", "onsite", "offer", "screen_reject", "rejected", "ghosted"})
 ACTION_WEIGHTS = {
-    "interested": 0.20,
-    "shortlisted": 0.35,
-    "applied": 0.45,
-    "responded": 0.55,
-    "interview": 0.80,
-    "onsite": 0.92,
-    "offer": 1.00,
-    "dismissed": -0.65,
+    "interested": 0.22,
+    "shortlisted": 0.38,
+    "applied": 0.50,
+    "dismissed": -0.70,
     "archived": -0.35,
-    "ghosted": -0.40,
-    "screen_reject": -0.75,
-    "rejected": -0.90,
 }
 POSITIVE_ACTIONS = frozenset(action for action, weight in ACTION_WEIGHTS.items() if weight > 0)
 NEGATIVE_ACTIONS = frozenset(action for action, weight in ACTION_WEIGHTS.items() if weight < 0)
@@ -49,7 +44,10 @@ def _signal_score(total_weight: float, count: int) -> float:
 
 
 def build_feedback_adjustments(jobs: list, feedback_rows: list[dict]) -> dict[str, FeedbackAdjustment]:
-    usable_rows = [row for row in feedback_rows if (row.get("action") or "").strip().lower() in POSITIVE_ACTIONS | NEGATIVE_ACTIONS]
+    usable_rows = [
+        row for row in feedback_rows
+        if (row.get("action") or "").strip().lower() in PREFERENCE_ACTIONS
+    ]
     if len(usable_rows) < MIN_FEEDBACK_ROWS:
         return {getattr(job, "key", ""): FeedbackAdjustment(delta=0, reasons=[]) for job in jobs}
 

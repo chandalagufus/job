@@ -13,6 +13,18 @@ US_STATE_ABBRS = frozenset({
     "or","pa","ri","sc","sd","tn","tx","ut","vt","va","wa","wv","wi","wy","dc",
 })
 
+NON_US_LOCATION_MARKERS = (
+    " india", "(ind", "canada", "united kingdom", " uk", "europe", "emea",
+    "apac", "latam", "australia", "germany", "france", "spain", "netherlands",
+    "ireland", "singapore", "japan", "brazil", "mexico", "poland", "portugal",
+    "argentina", "sweden", "switzerland", "israel", "philippines", "denmark",
+    "finland", "norway", "romania",
+)
+COUNTRY_CODE_MARKERS = frozenset({
+    "ar", "au", "br", "ca", "ch", "cn", "de", "es", "fr", "gb", "ie",
+    "il", "in", "jp", "mx", "nl", "ph", "pl", "pt", "se", "sg", "uk",
+})
+
 
 @dataclass
 class Job:
@@ -252,37 +264,20 @@ def is_us_location(location: str) -> bool:
     loc = (location or "").strip().lower()
     if not loc or loc == "unknown location":
         return False
+    scope = remote_scope_status(loc)
+    if scope == "us":
+        return True
+    if scope in {"non_us", "unspecified"}:
+        return False
     parts = [part.strip() for part in loc.split(",") if part.strip()]
-    non_us_markers = (
-        " india", "(ind", "canada", "united kingdom", " uk", "europe", "emea",
-        "apac", "latam", "australia", "germany", "france", "spain", "netherlands",
-        "ireland", "singapore", "japan", "brazil", "mexico", "poland", "portugal",
-        "argentina", "sweden", "switzerland", "israel", "philippines", "denmark",
-        "finland", "norway", "romania",
-    )
-    country_code_markers = {
-        "ar", "au", "br", "ca", "ch", "cn", "de", "es", "fr", "gb", "ie",
-        "il", "in", "jp", "mx", "nl", "ph", "pl", "pt", "se", "sg", "uk",
-    }
-    has_non_us_marker = any(marker in f" {loc}" for marker in non_us_markers)
-    has_us_marker = (
-        "united states" in loc
-        or "u.s." in loc
-        or bool(re.search(r"\busa\b", loc))
-        or bool(re.search(r"\bus\b", loc))
-    )
     if "united states" in loc or "u.s." in loc:
         return True
     if re.search(r"\busa\b", loc):
         return True
     if re.search(r"\bus\b", loc):
         return True
-    if len(parts) >= 3 and parts[-1] in country_code_markers:
+    if len(parts) >= 3 and parts[-1] in COUNTRY_CODE_MARKERS:
         return False
-    if "remote" in loc:
-        if has_us_marker:
-            return True
-        return not has_non_us_marker
     if "washington, dc" in loc or "district of columbia" in loc:
         return True
     # City, State abbreviation — e.g. "Seattle, WA"
@@ -290,6 +285,28 @@ def is_us_location(location: str) -> bool:
     if m and m.group(1) in US_STATE_ABBRS:
         return True
     return False
+
+
+def remote_scope_status(location: str) -> str:
+    """Classify remote scope as us / non_us / unspecified / not_remote."""
+    loc = (location or "").strip().lower()
+    if "remote" not in loc:
+        return "not_remote"
+    has_us_marker = (
+        "united states" in loc
+        or "u.s." in loc
+        or bool(re.search(r"\busa\b", loc))
+        or bool(re.search(r"\bus\b", loc))
+        or "remote us" in loc
+        or "remote - us" in loc
+        or "remote, us" in loc
+        or "remote within the united states" in loc
+    )
+    if has_us_marker:
+        return "us"
+    if any(marker in f" {loc}" for marker in NON_US_LOCATION_MARKERS):
+        return "non_us"
+    return "unspecified"
 
 
 class BaseSource(ABC):

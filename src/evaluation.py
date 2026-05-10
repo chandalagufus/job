@@ -18,7 +18,7 @@ from .classifier import (
 from .config import Config
 from .profile import PROFILE, SKILLS_MODERATE, SKILLS_STRONG
 from .scoring_policy import DEFAULT_MAYBE_THRESHOLD, DEFAULT_YES_THRESHOLD, label_for_score
-from .sources.base import is_us_location
+from .sources.base import is_us_location, remote_scope_status
 
 EVAL_CFG = Config.load()
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -403,6 +403,11 @@ def _location_block(location: str, text: str, *, require_us_location: bool) -> s
     loc = (location or "").strip()
     if not loc or loc.lower() == "unknown location":
         return ""
+    remote_scope = remote_scope_status(loc)
+    if remote_scope == "us":
+        return ""
+    if remote_scope == "unspecified":
+        return ""
     if is_us_location(loc):
         return ""
     if "remote" in text and ("united states" in text or re.search(r"\busa?\b", text)):
@@ -412,13 +417,16 @@ def _location_block(location: str, text: str, *, require_us_location: bool) -> s
 
 def _dimension_location(location: str, text: str) -> tuple[int, str]:
     loc = (location or "").lower()
+    remote_scope = remote_scope_status(loc)
     preferred_locations = [str(item).lower() for item in PROFILE.get("preferred_locations", []) if item]
     preferred_tokens: set[str] = set()
     for item in preferred_locations:
         preferred_tokens.update(part.strip() for part in re.split(r"[,/]", item) if part.strip())
 
-    if "remote" in loc or "united states" in loc or re.search(r"\busa?\b", loc):
+    if remote_scope == "us" or "united states" in loc or re.search(r"\busa?\b", loc):
         return 90, "The location appears remote-friendly or clearly US-based."
+    if remote_scope == "unspecified":
+        return 69, "Remote scope is not specified clearly enough to assume US eligibility."
     if any(token and token in loc for token in preferred_tokens):
         return 92, f"The location matches one of your approved markets: {location}."
     if any(token and token in text for token in preferred_tokens):
@@ -428,6 +436,17 @@ def _dimension_location(location: str, text: str) -> tuple[int, str]:
     if "remote" in text:
         return 80, "The job text suggests remote work."
     return 40, "Location information is weak or missing."
+
+
+def _remote_scope_review_reason(location: str, text: str) -> str:
+    loc_text = f" {location or ''} {text or ''} ".lower()
+    if "remote" not in loc_text:
+        return ""
+    if remote_scope_status(loc_text) == "us":
+        return ""
+    if remote_scope_status(loc_text) == "non_us":
+        return ""
+    return "Remote scope not specified — verify US eligibility before applying."
 
 
 def _onsite_mismatch_cap(location: str, text: str) -> tuple[int, str]:
@@ -637,9 +656,12 @@ def evaluate_job(
     evidence_cap, evidence_cap_reason = _evidence_score_cap(description, source)
     resume_cap, resume_cap_reason = _resume_gap_score_cap(assessment)
     onsite_cap, onsite_cap_reason = _onsite_mismatch_cap(location, text)
+    remote_review_reason = _remote_scope_review_reason(location, text)
     score = min(score, evidence_cap)
     score = min(score, resume_cap)
     score = min(score, onsite_cap)
+    if remote_review_reason:
+        score = min(score, 69)
     score = max(0, min(score, 100))
     grade = _score_to_grade(score)
     label = _score_to_label(score, yes_threshold=yes_threshold, maybe_threshold=maybe_threshold)
@@ -654,6 +676,8 @@ def evaluate_job(
         reasons.insert(0, resume_cap_reason)
     if onsite_cap_reason and onsite_cap_reason not in reasons:
         reasons.insert(0, onsite_cap_reason)
+    if remote_review_reason and remote_review_reason not in reasons:
+        reasons.insert(0, remote_review_reason)
     reasons = reasons[:4]
     fit_summary = f"Grade {grade} ({score}/100). " + " ".join(reasons[:3])
 

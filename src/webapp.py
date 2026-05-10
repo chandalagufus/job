@@ -24,7 +24,7 @@ from .evaluation import evaluate_job
 from .job_intelligence import extract_workday_req_id
 from .scoring_policy import calibrate_thresholds
 from .resume_builder import generate_resume_packet
-from .sources.base import is_us_location
+from .sources.base import is_us_location, remote_scope_status
 
 PIPELINE_STATUSES = [
     "new",
@@ -317,6 +317,14 @@ def _queue_match(job: dict, queue: str, status: str) -> bool:
     if queue == "actionable":
         return pipeline_status in {"new", "shortlisted", "resume_generated", "applied", "interview", "onsite"}
     return True
+
+
+def _location_allowed_for_review(location: str, *, require_us_location: bool) -> bool:
+    if not require_us_location:
+        return True
+    if is_us_location(location):
+        return True
+    return remote_scope_status(location) == "unspecified"
 
 
 def _feature_defaults(cfg: Config) -> dict[str, bool]:
@@ -871,11 +879,11 @@ def serve_web(
         if cfg.filter.require_us_location:
             hidden_non_us_count = sum(
                 1 for job in filtered_jobs
-                if not is_us_location(job.get("location", ""))
+                if not _location_allowed_for_review(job.get("location", ""), require_us_location=True)
             )
             filtered_jobs = [
                 job for job in filtered_jobs
-                if is_us_location(job.get("location", ""))
+                if _location_allowed_for_review(job.get("location", ""), require_us_location=True)
             ]
 
         all_jobs = _dedupe_board_jobs(filtered_jobs)

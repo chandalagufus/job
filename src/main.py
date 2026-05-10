@@ -37,7 +37,7 @@ from .feedback_scorer import build_feedback_adjustments
 from .job_intelligence import to_structured_json
 from .notifier import CompositeNotifier, EmailNotifier, SlackNotifier, DiscordNotifier
 from .scoring_policy import calibrate_thresholds, label_for_score, resume_fit_cap
-from .sources.base import Job, is_us_location
+from .sources.base import Job, is_us_location, remote_scope_status
 from .sources.eightfold import EightfoldSource
 from .sources.amazon import AmazonSource
 from .sources.goldman import GoldmanSachsSource
@@ -307,13 +307,29 @@ def _is_too_old(posted: str, max_days: int = MAX_JOB_AGE_DAYS) -> bool:
 
 
 def _dedup_jobs(jobs: list[Job]) -> list[Job]:
-    """Remove duplicate jobs with identical (company, title) — keeps highest score."""
+    """Remove duplicates using the best stable identity available."""
     best: dict[tuple, Job] = {}
     for j in jobs:
-        fp = (j.company.strip().lower(), j.title.strip().lower())
+        canonical_key = str(getattr(j, "canonical_key", "") or "").strip().lower()
+        normalized_url = re.sub(r"[?#].*$", "", (j.url or "").strip().lower()).rstrip("/")
+        location = (j.location or "").strip().lower()
+        if canonical_key:
+            fp = ("canonical", canonical_key)
+        elif normalized_url:
+            fp = ("url", normalized_url)
+        else:
+            fp = ("triple", j.company.strip().lower(), j.title.strip().lower(), location)
         if fp not in best or j.score > best[fp].score:
             best[fp] = j
     return list(best.values())
+
+
+def _passes_initial_location_filter(location: str, *, require_us_location: bool) -> bool:
+    if not require_us_location:
+        return True
+    if is_us_location(location):
+        return True
+    return remote_scope_status(location) == "unspecified"
 
 
 def _load_structured_json(raw: str) -> dict:
@@ -1029,7 +1045,7 @@ def _dispatch_results(
     matched = [
         j for j in all_jobs
         if j.label in ("yes", "maybe") and (
-            not cfg.filter.require_us_location or is_us_location(j.location)
+            _passes_initial_location_filter(j.location, require_us_location=cfg.filter.require_us_location)
         )
     ]
 
@@ -1041,7 +1057,7 @@ def _dispatch_results(
     if dropped:
         log.info("Age filter: dropped %d stale job(s) older than %d days", dropped, MAX_JOB_AGE_DAYS)
 
-    # Deduplication — keep only one entry per (company, title) pair
+    # Deduplication — prefer canonical/job URL identity, then fall back to company/title/location
     before_dedup = len(matched)
     matched = _dedup_jobs(matched)
     dupes = before_dedup - len(matched)
