@@ -877,8 +877,10 @@ def serve_web(
         _sort_jobs(jobs, sort_by)
         return jobs, hidden_non_us_count, all_jobs, hidden_workday_keys
 
-    def _filtered_jobs_snapshot(filters: dict[str, str], *, limit: int = 500) -> list[dict]:
+    def _filtered_jobs_snapshot(filters: dict[str, str], *, limit: int | None = 500) -> list[dict]:
         jobs, _, _, _ = _current_view_jobs(filters)
+        if limit is None:
+            return jobs
         return jobs[: max(limit, 1)]
 
     def _batch_refresh(jobs: list[dict]) -> int:
@@ -946,11 +948,14 @@ def serve_web(
             days = max(int(days_raw), 1)
         except ValueError:
             days = RECENT_JOB_DAYS
-        try:
-            rescore_limit = max(int(rescore_limit_raw), 1)
-        except ValueError:
-            rescore_limit = 500
-            rescore_limit_raw = "500"
+        if rescore_limit_raw == "all":
+            rescore_limit = None
+        else:
+            try:
+                rescore_limit = max(int(rescore_limit_raw), 1)
+            except ValueError:
+                rescore_limit = 500
+                rescore_limit_raw = "500"
         jobs, hidden_non_us_count, all_jobs, hidden_workday_keys = _current_view_jobs(
             {
                 "days": days_raw,
@@ -1049,7 +1054,7 @@ def serve_web(
         page_message_html = f"<p><strong>{escape(page_message)}</strong></p>" if page_message else ""
         rescore_options = "".join(
             f"<option value=\"{value}\"{' selected' if rescore_limit_raw == value else ''}>{label}</option>"
-            for value, label in (("100", "100 jobs"), ("250", "250 jobs"), ("500", "500 jobs"), ("1000", "1000 jobs"))
+            for value, label in (("100", "100 jobs"), ("250", "250 jobs"), ("500", "500 jobs"), ("1000", "1000 jobs"), ("all", "All jobs"))
         )
         body = (
             "<div class=\"card\">"
@@ -1661,10 +1666,14 @@ def serve_web(
 
         if path == "/jobs/re-evaluate" and method == "POST":
             form = _read_post(environ)
-            try:
-                rescore_limit = max(int(form.get("rescore_limit", "500") or "500"), 1)
-            except ValueError:
-                rescore_limit = 500
+            rescore_limit_raw = form.get("rescore_limit", "500") or "500"
+            if rescore_limit_raw == "all":
+                rescore_limit = None
+            else:
+                try:
+                    rescore_limit = max(int(rescore_limit_raw), 1)
+                except ValueError:
+                    rescore_limit = 500
             jobs = _filtered_jobs_snapshot(form, limit=rescore_limit)
             processed = _batch_refresh(jobs)
             return _redirect_home(form, message=f"Re-scored {processed} job(s) from the current filtered view.")
