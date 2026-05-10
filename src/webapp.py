@@ -1209,12 +1209,19 @@ def serve_web(
             ("visa_sponsorship", "Visa Sponsorship"),
             ("security_clearance", "Security Clearance"),
             ("employment_type", "Employment Type"),
+            ("resume_match_score", "Resume/JD Match"),
+            ("company_priority_delta", "Company Priority Delta"),
+            ("company_priority_reason", "Company Priority Reason"),
+            ("feedback_score_delta", "Feedback Score Delta"),
+            ("feedback_reasons", "Feedback Reasons"),
         ):
             if field not in structured:
                 continue
             value = structured[field]
             if isinstance(value, bool):
                 display = "Yes" if value else "No"
+            elif isinstance(value, list):
+                display = ", ".join(str(item) for item in value) if value else ""
             elif isinstance(value, int) and field.startswith("salary_"):
                 display = f"${value:,}"
             else:
@@ -1294,6 +1301,7 @@ def serve_web(
             f"<label>Notes<br><textarea name=\"pipeline_notes\">{escape(job.get('pipeline_notes') or '')}</textarea></label>"
             "<div class=\"actions\"><button type=\"submit\">Save Pipeline Status</button></div>"
             "</form>"
+            "<p class=\"muted\">Statuses like Applied, Shortlisted, Interview, Rejected, and Archived also feed the lightweight feedback reranker.</p>"
             f"<p class=\"muted\">Last updated: {escape(job.get('pipeline_updated_at') or 'never')}</p>"
             "</div>"
             "</div>"

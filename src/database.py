@@ -161,6 +161,14 @@ CREATE TABLE IF NOT EXISTS feature_flags (
     updated_at  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS feedback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_key     TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    notes       TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS source_runs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     source_key    TEXT NOT NULL,
@@ -189,6 +197,8 @@ CREATE INDEX IF NOT EXISTS idx_boards_platform ON boards(platform);
 CREATE INDEX IF NOT EXISTS idx_boards_status   ON boards(status);
 CREATE INDEX IF NOT EXISTS idx_generated_resumes_job_key ON generated_resumes(job_key);
 CREATE INDEX IF NOT EXISTS idx_generated_artifacts_resume_id ON generated_artifacts(resume_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_job_key ON feedback(job_key);
+CREATE INDEX IF NOT EXISTS idx_feedback_action ON feedback(action);
 CREATE INDEX IF NOT EXISTS idx_source_runs_source_key ON source_runs(source_key);
 CREATE INDEX IF NOT EXISTS idx_source_runs_finished_at ON source_runs(finished_at);
 """
@@ -725,6 +735,95 @@ class Database:
                 """,
                 (pipeline_status, pipeline_notes, follow_up_date, now, key),
             )
+        feedback_action = self._feedback_action_for_pipeline(pipeline_status)
+        if feedback_action:
+            self.record_feedback(job_key=key, action=feedback_action, notes=f"pipeline:{pipeline_status}")
+
+    def _feedback_action_for_pipeline(self, pipeline_status: str) -> str:
+        status = (pipeline_status or "").strip().lower()
+        mapping = {
+            "shortlisted": "shortlisted",
+            "applied": "applied",
+            "interview": "interview",
+            "offer": "offer",
+            "rejected": "rejected",
+            "archived": "archived",
+        }
+        return mapping.get(status, "")
+
+    def record_feedback(self, *, job_key: str, action: str, notes: str = "") -> bool:
+        valid_actions = {
+            "applied",
+            "dismissed",
+            "interested",
+            "shortlisted",
+            "interview",
+            "responded",
+            "rejected",
+            "offer",
+            "archived",
+        }
+        if action not in valid_actions:
+            raise ValueError(f"action must be one of {sorted(valid_actions)}, got {action!r}")
+        with self._lock:
+            exists = self._conn.execute("SELECT 1 FROM jobs WHERE key=?", (job_key,)).fetchone() is not None
+            latest = self._conn.execute(
+                "SELECT action, notes FROM feedback WHERE job_key=? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (job_key,),
+            ).fetchone()
+        if latest is not None and str(latest["action"] or "") == action and str(latest["notes"] or "") == (notes or ""):
+            return exists
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO feedback(job_key, action, created_at, notes) VALUES(?,?,?,?)",
+                (job_key, action, _now(), notes or ""),
+            )
+        return exists
+
+    def get_feedback_stats(self) -> dict:
+        rows = self._conn.execute(
+            "SELECT action, COUNT(*) as cnt FROM feedback GROUP BY action"
+        ).fetchall()
+        stats = {
+            "applied": 0,
+            "dismissed": 0,
+            "interested": 0,
+            "shortlisted": 0,
+            "interview": 0,
+            "offer": 0,
+            "rejected": 0,
+            "archived": 0,
+            "total": 0,
+        }
+        for row in rows:
+            stats[str(row["action"])] = int(row["cnt"] or 0)
+        stats["total"] = sum(value for key, value in stats.items() if key != "total")
+        return stats
+
+    def get_feedback_jobs(self, action: str | None = None) -> list[dict]:
+        if action:
+            rows = self._conn.execute(
+                """
+                SELECT f.job_key, f.action, f.created_at, f.notes,
+                       j.company, j.title, j.url, j.score, j.label, j.source, j.pipeline_status
+                FROM feedback f
+                LEFT JOIN jobs j ON j.key = f.job_key
+                WHERE f.action = ?
+                ORDER BY f.created_at DESC, f.id DESC
+                """,
+                (action,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT f.job_key, f.action, f.created_at, f.notes,
+                       j.company, j.title, j.url, j.score, j.label, j.source, j.pipeline_status
+                FROM feedback f
+                LEFT JOIN jobs j ON j.key = f.job_key
+                ORDER BY f.created_at DESC, f.id DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def create_manual_job(
         self,

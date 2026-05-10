@@ -29,9 +29,11 @@ from pathlib import Path
 from typing import Optional
 
 from .classifier import is_match, classify
+from .company_priority import company_score_adjustment
 from .config import Config
 from .database import Database
 from .evaluation import evaluate_job
+from .feedback_scorer import build_feedback_adjustments
 from .job_intelligence import to_structured_json
 from .notifier import CompositeNotifier, EmailNotifier, SlackNotifier, DiscordNotifier
 from .sources.base import Job, is_us_location
@@ -316,7 +318,20 @@ def _dedup_jobs(jobs: list[Job]) -> list[Job]:
 def _load_structured_json(raw: str) -> dict:
     text = (raw or "").strip()
     if not text:
-        return {}
+    return {}
+
+
+def _dimension_score(evaluation, name: str) -> int:
+    for dim in evaluation.dimensions:
+        if dim.name == name:
+            return int(dim.score)
+    return 0
+
+
+def _resume_match_score(evaluation) -> int:
+    evidence = _dimension_score(evaluation, "evidence_quality")
+    overlap = _dimension_score(evaluation, "skill_overlap")
+    return max(0, min(100, round(0.6 * evidence + 0.4 * overlap)))
     try:
         parsed = json.loads(text)
     except Exception:
@@ -1028,7 +1043,10 @@ def _dispatch_results(
     if dupes:
         log.info("Dedup: removed %d duplicate(s)", dupes)
 
-    # Structured evaluation
+    # Structured evaluation + company priority/exclusion
+    filtered_matched: list[Job] = []
+    company_excluded = 0
+    company_boosted = 0
     for j in matched:
         evaluation = evaluate_job(
             j.title,
@@ -1051,12 +1069,59 @@ def _dispatch_results(
         )
         merged_structured = dict(intelligence.get("structured") or {})
         merged_structured.update(_load_structured_json(getattr(j, "structured_json", "")))
+        resume_match_score = _resume_match_score(evaluation)
+        company_delta, company_reason = company_score_adjustment(j.company)
+        if company_delta == -999:
+            company_excluded += 1
+            continue
+        if company_delta > 0:
+            company_boosted += 1
+            j.score = min(100, j.score + company_delta)
+            if j.score >= 70:
+                j.label = "yes"
+            elif j.score >= 40:
+                j.label = "maybe"
+            else:
+                j.label = "no"
+        merged_structured["resume_match_score"] = resume_match_score
+        merged_structured["company_priority_delta"] = company_delta
+        merged_structured["company_priority_reason"] = company_reason
         j.structured_json = to_structured_json(merged_structured)
         j.is_repost = intelligence["is_repost"]
         j.repost_of_key = intelligence["repost_of_key"]
         j.canonical_key = intelligence["canonical_key"]
         j.employer_quality_score = intelligence["employer_quality_score"]
         j.employer_quality_reason = intelligence["employer_quality_reason"]
+        filtered_matched.append(j)
+
+    matched = filtered_matched
+    if company_excluded:
+        log.info("Company filter: excluded %d job(s) by employer rule.", company_excluded)
+    if company_boosted:
+        log.info("Company priority: boosted %d job(s).", company_boosted)
+
+    feedback_adjustments = build_feedback_adjustments(matched, db.get_feedback_jobs())
+    feedback_adjusted = 0
+    for j in matched:
+        adjustment = feedback_adjustments.get(j.key)
+        if adjustment is None:
+            continue
+        if adjustment.delta:
+            feedback_adjusted += 1
+            j.score = max(0, min(100, j.score + adjustment.delta))
+            if j.score >= 70:
+                j.label = "yes"
+            elif j.score >= 40:
+                j.label = "maybe"
+            else:
+                j.label = "no"
+        merged_structured = _load_structured_json(getattr(j, "structured_json", ""))
+        merged_structured["feedback_score_delta"] = adjustment.delta
+        merged_structured["feedback_reasons"] = adjustment.reasons
+        j.structured_json = to_structured_json(merged_structured)
+
+    if feedback_adjusted:
+        log.info("Feedback rescoring: adjusted %d job(s) using recorded user actions.", feedback_adjusted)
 
     yes_jobs = sorted([j for j in matched if j.label == "yes"], key=lambda j: j.score, reverse=True)
     maybe_jobs = sorted([j for j in matched if j.label == "maybe"], key=lambda j: j.score, reverse=True)
