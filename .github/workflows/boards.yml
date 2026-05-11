@@ -2,7 +2,7 @@ name: Job Radar — Board Sweep
 
 on:
   schedule:
-    - cron: "0 */2 * * *"    # Every 2 hours
+    - cron: "12 */2 * * *"   # Every 2 hours, offset from main and top-of-hour traffic
   workflow_dispatch:
     inputs:
       batch_size:
