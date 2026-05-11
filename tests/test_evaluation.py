@@ -152,6 +152,29 @@ class EvaluationEvidenceTests(unittest.TestCase):
         self.assertNotEqual(result.label, "no")
         self.assertFalse(any("hard exclusion" in reason.lower() for reason in result.reasons))
 
+    def test_equal_opportunity_citizenship_text_does_not_hard_block_role(self) -> None:
+        jd = (
+            "Build scalable evaluations for LLM performance on scientific reasoning.\n"
+            "Strong background in LLM training and deployment.\n"
+            "Equal employment opportunity regardless of race, color, age, citizenship, or veteran status.\n"
+        )
+        evidence = (
+            "Built LLM evaluation harnesses, RAG systems, and model quality workflows for scientific use cases."
+        )
+
+        with patch("src.evaluation._resume_evidence_text", return_value=evidence):
+            result = evaluate_job(
+                "Machine Learning Scientist, LLM Training & Inference Research",
+                jd,
+                company="Lila Sciences",
+                location="Cambridge, MA",
+                source="linkedin",
+                require_us_location=False,
+            )
+
+        self.assertNotEqual(result.score, 0)
+        self.assertFalse(any("citizenship" in reason.lower() and "blocked" in reason.lower() for reason in result.reasons))
+
 
 if __name__ == "__main__":
     unittest.main()

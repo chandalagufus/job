@@ -125,6 +125,20 @@ TARGET_ROLE_ALIASES: dict[str, tuple[str, ...]] = {
     "Data Scientist": ("data scientist", "ds"),
     "AI Engineer": ("ai engineer", "genai engineer", "generative ai engineer"),
 }
+EVAL_CLEARANCE_CONTEXT_REGEXES: tuple[str, ...] = (
+    r"\bts[/\s\-]?sci\b",
+    r"\btop\s+secret\b",
+    r"\bpolygraph\b",
+    r"\bpublic\s+trust\b",
+    r"\bmust\s+be\s+(?:a\s+)?u\.?s\.?\s+citizen\b",
+    r"\bu\.?s\.?\s+citizen(?:ship)?\s+(?:is\s+)?required\b",
+    r"\bcitizenship\s+(?:is\s+)?required\b",
+    r"\brequires?\s+(?:an?\s+)?(?:active\s+)?(?:security\s+)?clearance\b",
+    r"\bmust\s+hold\s+(?:an?\s+)?(?:active\s+)?(?:security\s+)?clearance\b",
+    r"\bability\s+to\s+obtain\s+(?:an?\s+)?(?:active\s+)?(?:security\s+)?clearance\b",
+    r"\bclearance\s+eligible\b",
+    r"\bactive\s+(?:secret|top\s+secret|ts[/\s\-]?sci)\b",
+)
 
 
 @dataclass
@@ -415,9 +429,12 @@ def _has_clearance_block(title: str, text: str) -> str:
     for phrase in CLEARANCE_EXCLUDE_PHRASES:
         if phrase in full_text:
             return f"Blocked by clearance/citizenship phrase: {phrase}."
-    for pattern in CLEARANCE_EXCLUDE_REGEXES:
+    for pattern in EVAL_CLEARANCE_CONTEXT_REGEXES:
         if re.search(pattern, full_text):
             return "Blocked by hard exclusion in the job title or description."
+    for pattern in CLEARANCE_EXCLUDE_REGEXES:
+        if re.search(pattern, title_text):
+            return "Blocked by hard exclusion in the job title."
     for pattern in HARD_EXCLUDE_REGEXES:
         if re.search(pattern, title_text):
             return "Blocked by hard exclusion in the job title."
