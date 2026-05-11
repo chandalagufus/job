@@ -684,6 +684,11 @@ def run_boards(
         log.warning("scanner_boards feature is disabled. Skipping boards mode run.")
         return
 
+    if export_dead_csv and dry_run:
+        db.export_dead_boards_csv(export_dead_csv)
+        log.info("Exported dead boards report to %s without running a sweep batch.", export_dead_csv)
+        return {}
+
     boards = load_boards_csv(boards_csv)
     boards = [b for b in boards if b.get("platform") in SUPPORTED_BOARD_PLATFORMS]
 
