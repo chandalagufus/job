@@ -409,13 +409,18 @@ def _score_to_grade(score: int) -> str:
     return "F"
 
 
-def _has_clearance_block(text: str) -> str:
+def _has_clearance_block(title: str, text: str) -> str:
+    title_text = (title or "").strip().lower()
+    full_text = text or ""
     for phrase in CLEARANCE_EXCLUDE_PHRASES:
-        if phrase in text:
+        if phrase in full_text:
             return f"Blocked by clearance/citizenship phrase: {phrase}."
-    for pattern in CLEARANCE_EXCLUDE_REGEXES + HARD_EXCLUDE_REGEXES:
-        if re.search(pattern, text):
+    for pattern in CLEARANCE_EXCLUDE_REGEXES:
+        if re.search(pattern, full_text):
             return "Blocked by hard exclusion in the job title or description."
+    for pattern in HARD_EXCLUDE_REGEXES:
+        if re.search(pattern, title_text):
+            return "Blocked by hard exclusion in the job title."
     return ""
 
 
@@ -660,7 +665,7 @@ def _resume_gap_score_cap(assessment: SkillEvidenceAssessment) -> tuple[int, str
 
 
 def _dimension_risk(text: str) -> tuple[int, str]:
-    block = _has_clearance_block(text)
+    block = _has_clearance_block("", text)
     if block:
         return 0, block
     return 92, "No clearance or citizenship blockers were detected."
@@ -684,7 +689,7 @@ def evaluate_job(
     assessment = _assess_skill_evidence(title, description, matched_strong, matched_moderate)
     role_hits = _target_role_hits(text)
 
-    clearance_block = _has_clearance_block(text)
+    clearance_block = _has_clearance_block(title, text)
     if clearance_block:
         dimensions = [
             EvaluationDimension("risk", 0.10, 0, clearance_block),

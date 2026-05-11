@@ -130,6 +130,28 @@ class EvaluationEvidenceTests(unittest.TestCase):
         self.assertIn("python", sections.get("required", "").lower())
         self.assertIn("tableau", sections.get("preferred", "").lower())
 
+    def test_part_time_in_benefits_text_does_not_hard_block_role(self) -> None:
+        jd = (
+            "What you'll do: Build python and sql data pipelines.\n"
+            "Benefits include support for full-time and part-time associates.\n"
+            "Preferred Qualifications: Kafka.\n"
+        )
+        evidence = "Built Python and SQL data pipelines for production analytics systems."
+
+        with patch("src.evaluation._resume_evidence_text", return_value=evidence):
+            result = evaluate_job(
+                "Data Engineer II",
+                jd,
+                company="Walmart",
+                location="Sunnyvale, CA",
+                source="linkedin",
+                require_us_location=False,
+            )
+
+        self.assertNotEqual(result.score, 0)
+        self.assertNotEqual(result.label, "no")
+        self.assertFalse(any("hard exclusion" in reason.lower() for reason in result.reasons))
+
 
 if __name__ == "__main__":
     unittest.main()
