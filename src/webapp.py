@@ -57,6 +57,7 @@ DATE_FORMATS = (
 )
 
 log = logging.getLogger(__name__)
+STATE_DB_FILENAMES = ("gha-jobs.db", "gha-boards.db")
 
 
 def _resolve_db_path(repo_root: str, raw_path: str) -> Path:
@@ -67,12 +68,18 @@ def _resolve_db_path(repo_root: str, raw_path: str) -> Path:
     return (base / candidate).resolve()
 
 
+def _state_db_paths(root: Path) -> list[Path]:
+    return [(root / "state" / name).resolve() for name in STATE_DB_FILENAMES]
+
+
 def _db_snapshot(path: Path) -> dict[str, object]:
     snapshot: dict[str, object] = {
         "path": path,
         "exists": path.exists(),
+        "healthy": False,
         "total_jobs": 0,
         "recent_jobs_24h": 0,
+        "recent_first_seen_24h": 0,
         "last_seen": "",
         "fresh_ts": 0.0,
     }
@@ -85,10 +92,14 @@ def _db_snapshot(path: Path) -> dict[str, object]:
         snapshot["recent_jobs_24h"] = int(
             conn.execute("SELECT COUNT(*) FROM jobs WHERE last_seen >= datetime('now','-1 day')").fetchone()[0]
         )
+        snapshot["recent_first_seen_24h"] = int(
+            conn.execute("SELECT COUNT(*) FROM jobs WHERE first_seen >= datetime('now','-1 day')").fetchone()[0]
+        )
         last_seen = str(conn.execute("SELECT MAX(last_seen) FROM jobs").fetchone()[0] or "")
         snapshot["last_seen"] = last_seen
         parsed = _parse_datetime(last_seen)
         snapshot["fresh_ts"] = parsed.timestamp() if parsed else 0.0
+        snapshot["healthy"] = True
         return snapshot
     except sqlite3.Error:
         return snapshot
@@ -100,11 +111,11 @@ def _dashboard_source_label(repo_root: str, path: Path) -> str:
     root = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
     resolved = path.resolve()
     public_export = (root / "public-export").resolve()
-    if resolved == (public_export / "state" / "gha-jobs.db").resolve():
+    if resolved in set(_state_db_paths(public_export)):
         return "public-export"
-    if root.name.lower() == "public-export" and resolved == (root / "state" / "gha-jobs.db").resolve():
+    if root.name.lower() == "public-export" and resolved in set(_state_db_paths(root)):
         return "public-export"
-    if resolved == (root / "state" / "gha-jobs.db").resolve():
+    if resolved in set(_state_db_paths(root)):
         return "local"
     if "dashboard-merged-" in resolved.name:
         return "merged"
@@ -113,6 +124,16 @@ def _dashboard_source_label(repo_root: str, path: Path) -> str:
 
 def _copy_db_file(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
+    for sidecar in (
+        dst,
+        dst.with_name(dst.name + "-wal"),
+        dst.with_name(dst.name + "-shm"),
+    ):
+        try:
+            if sidecar.exists():
+                sidecar.unlink()
+        except OSError:
+            pass
     shutil.copy2(src, dst)
 
 
@@ -139,47 +160,93 @@ def _merge_jobs_into(base_path: Path, overlay_path: Path) -> None:
         base.close()
 
 
+def _safe_merge_dashboard_db(
+    repo_root: str,
+    snaps: list[dict[str, object]],
+    *,
+    strategy_label: str,
+) -> tuple[Path, str]:
+    ordered = sorted(
+        snaps,
+        key=lambda snap: (
+            float(snap["fresh_ts"]),
+            int(snap["recent_jobs_24h"]),
+            int(snap["total_jobs"]),
+        ),
+        reverse=True,
+    )
+    base_snap = ordered[0]
+    overlays = ordered[1:]
+    merge_key = "|".join(
+        f"{Path(snap['path']).name}:{int(float(snap['fresh_ts']))}:{int(snap['total_jobs'])}" for snap in ordered
+    )
+    merge_hash = hashlib.sha1(merge_key.encode("utf-8")).hexdigest()[:12]
+    merged_name = f"dashboard-merged-{merge_hash}.db"
+    merged_path = (Path(repo_root) / "state" / merged_name).resolve() if repo_root else Path(base_snap["path"])
+    try:
+        _copy_db_file(Path(base_snap["path"]), merged_path)
+        for overlay_snap in overlays:
+            _merge_jobs_into(merged_path, Path(overlay_snap["path"]))
+        return merged_path, strategy_label
+    except (sqlite3.Error, OSError) as exc:
+        base_path = Path(base_snap["path"])
+        log.warning(
+            "Dashboard DB merge failed for %s: %s. Falling back to %s.",
+            base_path,
+            exc,
+            base_path,
+        )
+        return base_path, f"{strategy_label}-fallback"
+
+
 def _select_dashboard_db(repo_root: str, db_path: str) -> tuple[Path, str]:
     primary = _resolve_db_path(repo_root, db_path)
-    candidates = [_db_snapshot(primary)]
     root = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
-    peer_paths: list[Path] = []
-    nested_public_export = (root / "public-export" / db_path).resolve()
-    if nested_public_export != primary:
-        peer_paths.append(nested_public_export)
+    candidate_paths: list[Path] = [primary]
+    candidate_paths.extend(path for path in _state_db_paths(root) if path != primary)
+    nested_public_export = (root / "public-export").resolve()
+    candidate_paths.extend(path for path in _state_db_paths(nested_public_export) if path != primary)
     if root.name.lower() == "public-export":
-        sibling_main = (root.parent / db_path).resolve()
-        if sibling_main != primary:
-            peer_paths.append(sibling_main)
-    for peer in peer_paths:
-        candidates.append(_db_snapshot(peer))
+        candidate_paths.extend(path for path in _state_db_paths(root.parent.resolve()) if path != primary)
+    deduped_paths: list[Path] = []
+    seen_paths: set[Path] = set()
+    for path in candidate_paths:
+        if path in seen_paths:
+            continue
+        deduped_paths.append(path)
+        seen_paths.add(path)
 
-    existing = [snap for snap in candidates if snap["exists"]]
+    existing = [snap for snap in (_db_snapshot(path) for path in deduped_paths) if snap["exists"] and bool(snap.get("healthy"))]
     if not existing:
         return primary, "primary-missing"
 
-    by_path = {Path(snap["path"]): snap for snap in existing}
-    public_candidate = None
-    for path, snap in by_path.items():
-        if _dashboard_source_label(repo_root, path) == "public-export":
-            public_candidate = snap
-            break
-    local_candidate = None
-    for path, snap in by_path.items():
-        if _dashboard_source_label(repo_root, path) == "local":
-            local_candidate = snap
-            break
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for snap in existing:
+        label = _dashboard_source_label(repo_root, Path(snap["path"]))
+        grouped.setdefault(label, []).append(snap)
+
+    def _collapse_group(label: str) -> dict[str, object] | None:
+        snaps = grouped.get(label, [])
+        if not snaps:
+            return None
+        if len(snaps) == 1:
+            return snaps[0]
+        merged_path, _ = _safe_merge_dashboard_db(repo_root, snaps, strategy_label=f"{label}-internal")
+        merged_snap = _db_snapshot(merged_path)
+        if merged_snap["exists"] and bool(merged_snap.get("healthy")):
+            return merged_snap
+        return snaps[0]
+
+    public_candidate = _collapse_group("public-export")
+    local_candidate = _collapse_group("local")
 
     if public_candidate and local_candidate:
         if int(public_candidate["recent_jobs_24h"]) > 0 and int(local_candidate["recent_jobs_24h"]) > 0:
-            best = public_candidate
-            other = local_candidate
-            suffix = f"{int(float(best['fresh_ts']))}-{int(float(other['fresh_ts']))}"
-            merged_name = f"dashboard-merged-{suffix}.db"
-            merged_path = (Path(repo_root) / "state" / merged_name).resolve() if repo_root else primary
-            _copy_db_file(Path(best["path"]), merged_path)
-            _merge_jobs_into(merged_path, Path(other["path"]))
-            return merged_path, "merged-public+local"
+            return _safe_merge_dashboard_db(
+                repo_root,
+                [public_candidate, local_candidate],
+                strategy_label="merged-public+local",
+            )
         return Path(public_candidate["path"]), "public-truth"
 
     if public_candidate:
@@ -198,12 +265,11 @@ def _select_dashboard_db(repo_root: str, db_path: str) -> tuple[Path, str]:
         return Path(best["path"]), "single"
     other = existing[1]
     if int(best["recent_jobs_24h"]) > 0 and int(other["recent_jobs_24h"]) > 0:
-        suffix = f"{int(float(best['fresh_ts']))}-{int(float(other['fresh_ts']))}"
-        merged_name = f"dashboard-merged-{suffix}.db"
-        merged_path = (Path(repo_root) / "state" / merged_name).resolve() if repo_root else primary
-        _copy_db_file(Path(best["path"]), merged_path)
-        _merge_jobs_into(merged_path, Path(other["path"]))
-        return merged_path, "merged"
+        return _safe_merge_dashboard_db(
+            repo_root,
+            [best, other],
+            strategy_label="merged",
+        )
     return Path(best["path"]), "freshest"
 
 
@@ -246,6 +312,14 @@ def _is_recent_job(job: dict, *, max_days: int = RECENT_JOB_DAYS) -> bool:
     return True
 
 
+def _is_recent_first_seen(job: dict, *, max_days: int = RECENT_JOB_DAYS) -> bool:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_days)
+    first_seen_dt = _parse_datetime(job.get("first_seen", ""))
+    if first_seen_dt is not None:
+        return first_seen_dt >= cutoff
+    return True
+
+
 def _job_sort_dt(job: dict) -> datetime:
     posted_dt = _parse_datetime(job.get("posted", ""))
     if posted_dt is not None:
@@ -264,11 +338,25 @@ def _job_sort_ts(job: dict) -> float:
 
 
 def _passes_freshness(job: dict, *, days_raw: str, max_days: int) -> bool:
+    if days_raw.startswith("seen_"):
+        return _is_recent_first_seen(job, max_days=max_days)
     if (job.get("source") or "").strip().lower() == "linkedin":
         return _is_recent_job(job, max_days=1)
     if days_raw == "all":
         return True
     return _is_recent_job(job, max_days=max_days)
+
+
+def _days_value_to_max_days(days_raw: str) -> int:
+    normalized = (days_raw or str(RECENT_JOB_DAYS)).strip().lower()
+    if normalized == "all":
+        return RECENT_JOB_DAYS
+    if normalized.startswith("seen_"):
+        normalized = normalized.split("_", 1)[1]
+    try:
+        return max(int(normalized), 1)
+    except ValueError:
+        return RECENT_JOB_DAYS
 
 
 def _source_match(job: dict, source: str) -> bool:
@@ -590,6 +678,7 @@ def serve_web(
         "source": _dashboard_source_label(repo_root, Path(active_dashboard_db_path)),
         "last_seen": "",
         "recent_jobs_24h": 0,
+        "recent_first_seen_24h": 0,
         "total_jobs": 0,
     }
     scan_state: dict[str, object] = {
@@ -622,6 +711,7 @@ def serve_web(
             "source": _dashboard_source_label(repo_root, replacement_path),
             "last_seen": snapshot.get("last_seen", ""),
             "recent_jobs_24h": snapshot.get("recent_jobs_24h", 0),
+            "recent_first_seen_24h": snapshot.get("recent_first_seen_24h", 0),
             "total_jobs": snapshot.get("total_jobs", 0),
         }
         if resolved_path == active_dashboard_db_path:
@@ -818,47 +908,101 @@ def serve_web(
     def _label_thresholds():
         return calibrate_thresholds(db.get_feedback_jobs())
 
-    def _persist_evaluation(job: dict) -> tuple[dict, object]:
-        db.refresh_job_intelligence(
-            key=job["key"],
-            source=job["source"],
-            company=job["company"],
-            title=job["title"],
-            location=job["location"],
-            url=job["url"],
-            description=job.get("description", ""),
-        )
-        job = db.get_job(job["key"]) or job
-        thresholds = _label_thresholds()
-        evaluation = evaluate_job(
-            job["title"],
-            job.get("description", ""),
-            company=job["company"],
-            location=job["location"],
-            source=job.get("source", ""),
+    def _backing_db_paths() -> list[str]:
+        root = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
+        primary = str(_resolve_db_path(repo_root, cfg.database.path))
+        paths = [primary]
+        paths.extend(str(path) for path in _state_db_paths(root) if str(path) != primary and path.exists())
+        public_root = (root / "public-export").resolve()
+        paths.extend(str(path) for path in _state_db_paths(public_root) if str(path) != primary and path.exists())
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for path in paths:
+            if path in seen:
+                continue
+            deduped.append(path)
+            seen.add(path)
+        return deduped
+
+    def _open_backing_dbs() -> list[tuple[str, Database]]:
+        opened: list[tuple[str, Database]] = []
+        for path in _backing_db_paths():
+            try:
+                opened.append((path, Database(path)))
+            except Exception as exc:
+                log.warning("Skipping backing DB %s for dashboard write: %s", path, exc)
+        return opened
+
+    def _evaluate_for_row(job_row: dict, thresholds) -> object:
+        return evaluate_job(
+            job_row["title"],
+            job_row.get("description", ""),
+            company=job_row["company"],
+            location=job_row["location"],
+            source=job_row.get("source", ""),
             require_us_location=cfg.filter.require_us_location,
             yes_threshold=thresholds.yes,
             maybe_threshold=thresholds.maybe,
         )
-        current_json = job.get("evaluation_json") or ""
+
+    def _refresh_and_update_in_db(target_db: Database, seed_job: dict, thresholds) -> tuple[dict, object] | None:
+        existing = target_db.get_job(seed_job["key"])
+        if existing is None:
+            return None
+        target_db.refresh_job_intelligence(
+            key=seed_job["key"],
+            source=seed_job["source"],
+            company=seed_job["company"],
+            title=seed_job["title"],
+            location=seed_job["location"],
+            url=seed_job["url"],
+            description=seed_job.get("description", ""),
+        )
+        refreshed = target_db.get_job(seed_job["key"]) or seed_job
+        evaluation = _evaluate_for_row(refreshed, thresholds)
+        current_json = refreshed.get("evaluation_json") or ""
         if (
-            evaluation.fit_summary != (job.get("fit_summary") or "")
-            or evaluation.score != job["score"]
-            or evaluation.label != job["label"]
-            or evaluation.grade != (job.get("grade") or "")
+            evaluation.fit_summary != (refreshed.get("fit_summary") or "")
+            or evaluation.score != refreshed["score"]
+            or evaluation.label != refreshed["label"]
+            or evaluation.grade != (refreshed.get("grade") or "")
             or evaluation.to_json() != current_json
         ):
-            db.update_job_evaluation(
-                key=job["key"],
+            target_db.update_job_evaluation(
+                key=seed_job["key"],
                 score=evaluation.score,
                 label=evaluation.label,
                 grade=evaluation.grade,
                 evaluation_json=evaluation.to_json(),
                 fit_summary=evaluation.fit_summary,
-                description=job.get("description", ""),
+                description=refreshed.get("description", ""),
             )
-            job = db.get_job(job["key"]) or job
-        return job, evaluation
+            refreshed = target_db.get_job(seed_job["key"]) or refreshed
+        return refreshed, evaluation
+
+    def _persist_evaluation(job: dict) -> tuple[dict, object]:
+        thresholds = _label_thresholds()
+        writers = _open_backing_dbs()
+        chosen_job = job
+        chosen_eval = _evaluate_for_row(job, thresholds)
+        try:
+            updated_any = False
+            for _, writer in writers:
+                result = _refresh_and_update_in_db(writer, job, thresholds)
+                if result is not None:
+                    chosen_job, chosen_eval = result
+                    updated_any = True
+            if not updated_any:
+                result = _refresh_and_update_in_db(db, job, thresholds)
+                if result is not None:
+                    chosen_job, chosen_eval = result
+            return chosen_job, chosen_eval
+        finally:
+            for path, writer in writers:
+                try:
+                    writer.close()
+                except Exception:
+                    log.debug("Failed to close backing DB %s after evaluation persist.", path)
 
     def _current_view_jobs(filters: dict[str, str]) -> tuple[list[dict], int, list[dict], set[str]]:
         days_raw = (filters.get("days") or str(RECENT_JOB_DAYS)).strip()
@@ -866,10 +1010,7 @@ def serve_web(
         status = (filters.get("status") or "all").strip().lower()
         source = (filters.get("source") or "all").strip().lower()
         sort_by = (filters.get("sort") or "newest").strip().lower()
-        try:
-            days = max(int(days_raw), 1)
-        except ValueError:
-            days = RECENT_JOB_DAYS
+        days = _days_value_to_max_days(days_raw)
 
         filtered_jobs = [
             job for job in db.list_jobs_for_board(limit=None)
@@ -904,49 +1045,44 @@ def serve_web(
         return jobs[: max(limit, 1)]
 
     def _batch_refresh(jobs: list[dict]) -> int:
-        for job in jobs:
-            if job is None:
-                continue
-            db.refresh_job_intelligence(
-                key=job["key"],
-                source=job["source"],
-                company=job["company"],
-                title=job["title"],
-                location=job["location"],
-                url=job["url"],
-                description=job.get("description", ""),
-            )
-            refreshed = db.get_job(job["key"]) or job
-            thresholds = _label_thresholds()
-            evaluation = evaluate_job(
-                refreshed["title"],
-                refreshed.get("description", ""),
-                company=refreshed["company"],
-                location=refreshed["location"],
-                source=refreshed.get("source", ""),
-                require_us_location=cfg.filter.require_us_location,
-                yes_threshold=thresholds.yes,
-                maybe_threshold=thresholds.maybe,
-            )
-            db.update_job_evaluation(
-                key=job["key"],
-                score=evaluation.score,
-                label=evaluation.label,
-                grade=evaluation.grade,
-                evaluation_json=evaluation.to_json(),
-                fit_summary=evaluation.fit_summary,
-                description=refreshed.get("description", ""),
-            )
-        return len(jobs)
+        thresholds = _label_thresholds()
+        writers = _open_backing_dbs()
+        try:
+            for job in jobs:
+                if job is None:
+                    continue
+                wrote = False
+                for _, writer in writers:
+                    result = _refresh_and_update_in_db(writer, job, thresholds)
+                    if result is not None:
+                        wrote = True
+                if not wrote:
+                    _refresh_and_update_in_db(db, job, thresholds)
+            return len(jobs)
+        finally:
+            for path, writer in writers:
+                try:
+                    writer.close()
+                except Exception:
+                    log.debug("Failed to close backing DB %s after batch refresh.", path)
 
     def _dedupe_board_jobs(rows: list[dict]) -> list[dict]:
-        best: dict[tuple[str, str, str], dict] = {}
+        best: dict[tuple[str, ...], dict] = {}
         for row in rows:
-            fingerprint = (
-                (row.get("source") or "").strip().lower(),
-                (row.get("company") or "").strip().lower(),
-                (row.get("title") or "").strip().lower(),
-            )
+            canonical_key = (row.get("canonical_key") or "").strip().lower()
+            normalized_url = re.sub(r"[?#].*$", "", (row.get("url") or "").strip().lower()).rstrip("/")
+            if canonical_key:
+                fingerprint = ("canonical", canonical_key)
+            elif normalized_url:
+                fingerprint = ("url", normalized_url)
+            else:
+                fingerprint = (
+                    "fallback",
+                    (row.get("source") or "").strip().lower(),
+                    (row.get("company") or "").strip().lower(),
+                    (row.get("title") or "").strip().lower(),
+                    (row.get("location") or "").strip().lower(),
+                )
             current = best.get(fingerprint)
             if current is None:
                 best[fingerprint] = row
@@ -967,10 +1103,7 @@ def serve_web(
         sort_by = ((query.get("sort") or ["newest"])[-1] or "newest").strip().lower()
         rescore_limit_raw = (query.get("rescore_limit") or ["500"])[-1]
         page_message = ((query.get("message") or [""])[-1] or "").strip()
-        try:
-            days = max(int(days_raw), 1)
-        except ValueError:
-            days = RECENT_JOB_DAYS
+        days = _days_value_to_max_days(days_raw)
         if rescore_limit_raw == "all":
             rescore_limit = None
         else:
@@ -1030,7 +1163,14 @@ def serve_web(
         )
         day_options = "".join(
             f"<option value=\"{value}\"{' selected' if days_raw == value else ''}>{label}</option>"
-            for value, label in (("1", "24 hours"), ("3", "3 days"), ("7", "7 days"), ("14", "14 days"), ("all", "All"))
+            for value, label in (
+                ("1", "24 hours (posted/seen)"),
+                ("seen_1", "24 hours (first seen)"),
+                ("3", "3 days"),
+                ("7", "7 days"),
+                ("14", "14 days"),
+                ("all", "All"),
+            )
         )
         sort_options = "".join(
             f"<option value=\"{name}\"{' selected' if sort_by == name else ''}>{label}</option>"
@@ -1059,6 +1199,7 @@ def serve_web(
         db_path_label = escape(str(db_meta.get("path") or ""))
         db_last_seen = escape(str(db_meta.get("last_seen") or "unknown"))
         db_recent_jobs = int(db_meta.get("recent_jobs_24h") or 0)
+        db_recent_first_seen_jobs = int(db_meta.get("recent_first_seen_24h") or 0)
         db_total_jobs = int(db_meta.get("total_jobs") or 0)
         shown_yes = sum(1 for job in jobs if (job.get("label") or "").strip().lower() == "yes")
         shown_maybe = sum(1 for job in jobs if (job.get("label") or "").strip().lower() == "maybe")
@@ -1087,7 +1228,7 @@ def serve_web(
             "<p class=\"muted\">Review fresh roles, update your pipeline quickly, and run scans without leaving the page.</p>"
             f"<p class=\"muted\">Dashboard data source: <strong>{db_source}</strong> | strategy: <strong>{db_strategy}</strong></p>"
             f"<p class=\"muted\">Active DB: <code>{db_path_label}</code></p>"
-            f"<p class=\"muted\">DB freshness: last seen <strong>{db_last_seen}</strong> | recent jobs (24h): <strong>{db_recent_jobs}</strong> | total stored: <strong>{db_total_jobs}</strong></p>"
+            f"<p class=\"muted\">DB freshness: last seen <strong>{db_last_seen}</strong> | recent jobs by posted/first-seen (24h): <strong>{db_recent_jobs}</strong> | recent jobs by first-seen only (24h): <strong>{db_recent_first_seen_jobs}</strong> | total stored: <strong>{db_total_jobs}</strong></p>"
             "<ul class=\"helper-list\">"
             "<li><strong>Scan Main Sources</strong> is the fastest local refresh for direct high-priority companies.</li>"
             "<li><strong>Scan Next Board Batch</strong> is the recommended local board action when you just want a quick incremental update.</li>"
