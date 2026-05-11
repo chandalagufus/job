@@ -375,7 +375,9 @@ def _structured_signal_pills(job: dict) -> str:
     elif data.get("visa_sponsorship") is False:
         pills.append("<span class=\"pill\">No visa sponsor</span>")
     if data.get("security_clearance"):
-        pills.append("<span class=\"pill\">Clearance</span>")
+        pills.append("<span class=\"pill\">Clearance req</span>")
+    if data.get("citizenship_requirement"):
+        pills.append("<span class=\"pill\">Citizenship req</span>")
     employment_type = str(data.get("employment_type") or "").strip()
     if employment_type:
         pills.append(f"<span class=\"pill\">{escape(employment_type.title())}</span>")
@@ -1234,6 +1236,7 @@ def serve_web(
             ("years_experience_max", "Experience Max"),
             ("visa_sponsorship", "Visa Sponsorship"),
             ("security_clearance", "Security Clearance"),
+            ("citizenship_requirement", "Citizenship Requirement"),
             ("employment_type", "Employment Type"),
             ("resume_match_score", "Resume/JD Match"),
             ("resume_match_cap", "Resume/JD Cap"),

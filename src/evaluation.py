@@ -423,21 +423,18 @@ def _score_to_grade(score: int) -> str:
     return "F"
 
 
-def _has_clearance_block(title: str, text: str) -> str:
+def _clearance_signal_reason(title: str, text: str) -> str:
     title_text = (title or "").strip().lower()
     full_text = text or ""
     for phrase in CLEARANCE_EXCLUDE_PHRASES:
         if phrase in full_text:
-            return f"Blocked by clearance/citizenship phrase: {phrase}."
+            return f"Clearance or citizenship requirement detected: {phrase}."
     for pattern in EVAL_CLEARANCE_CONTEXT_REGEXES:
         if re.search(pattern, full_text):
-            return "Blocked by hard exclusion in the job title or description."
+            return "Clearance or citizenship requirement detected in the job description."
     for pattern in CLEARANCE_EXCLUDE_REGEXES:
         if re.search(pattern, title_text):
-            return "Blocked by hard exclusion in the job title."
-    for pattern in HARD_EXCLUDE_REGEXES:
-        if re.search(pattern, title_text):
-            return "Blocked by hard exclusion in the job title."
+            return "Clearance or citizenship requirement detected in the job title."
     return ""
 
 
@@ -682,9 +679,9 @@ def _resume_gap_score_cap(assessment: SkillEvidenceAssessment) -> tuple[int, str
 
 
 def _dimension_risk(text: str) -> tuple[int, str]:
-    block = _has_clearance_block("", text)
-    if block:
-        return 0, block
+    risk_flag = _clearance_signal_reason("", text)
+    if risk_flag:
+        return 18, risk_flag
     return 92, "No clearance or citizenship blockers were detected."
 
 
@@ -705,31 +702,6 @@ def evaluate_job(
     matched_strong, matched_moderate, strong_points, moderate_points = _match_skills(title, description)
     assessment = _assess_skill_evidence(title, description, matched_strong, matched_moderate)
     role_hits = _target_role_hits(text)
-
-    clearance_block = _has_clearance_block(title, text)
-    if clearance_block:
-        dimensions = [
-            EvaluationDimension("risk", 0.10, 0, clearance_block),
-            EvaluationDimension("title_fit", 0.25, 0, "Evaluation stopped because the posting is blocked."),
-            EvaluationDimension("skill_overlap", 0.25, 0, "Evaluation stopped because the posting is blocked."),
-            EvaluationDimension("target_alignment", 0.15, 0, "Evaluation stopped because the posting is blocked."),
-            EvaluationDimension("seniority_fit", 0.10, 0, "Evaluation stopped because the posting is blocked."),
-            EvaluationDimension("location_fit", 0.05, 0, "Evaluation stopped because the posting is blocked."),
-            EvaluationDimension("evidence_quality", 0.10, 0, "Evaluation stopped because the posting is blocked."),
-        ]
-        return EvaluationResult(
-            score=0,
-            label="no",
-            grade="F",
-            matched_strong=matched_strong,
-            matched_moderate=matched_moderate,
-            unsupported_strong=assessment.unsupported_strong,
-            unsupported_moderate=assessment.unsupported_moderate,
-            critical_skill_gaps=assessment.critical_skill_gaps,
-            reasons=[clearance_block],
-            fit_summary=clearance_block,
-            dimensions=dimensions,
-        )
 
     location_block = _location_block(location, text, require_us_location=require_us_location)
     if location_block:

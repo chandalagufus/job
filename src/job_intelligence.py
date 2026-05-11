@@ -76,6 +76,10 @@ _CLEARANCE_RE = re.compile(
     r"\b(secret|top secret|ts/sci|ts sci|security clearance|public trust)\b",
     re.IGNORECASE,
 )
+_CITIZENSHIP_REQ_RE = re.compile(
+    r"\b(must\s+be\s+(?:a\s+)?u\.?s\.?\s+citizen|u\.?s\.?\s+citizen(?:ship)?\s+(?:is\s+)?required|citizenship\s+(?:is\s+)?required)\b",
+    re.IGNORECASE,
+)
 _WORKDAY_REQ_RE = re.compile(r"(R-\d+)(?:-\d+)?", re.IGNORECASE)
 _AGENCY_RE = re.compile(r"\b(?:" + "|".join(_AGENCY_PATTERNS) + r")\b", re.IGNORECASE)
 _VENDOR_RE = re.compile(r"\b(?:" + "|".join(_VENDOR_PATTERNS) + r")\b", re.IGNORECASE)
@@ -321,6 +325,8 @@ def extract_structured_fields(title: str, description: str, *, location: str = "
 
     if _CLEARANCE_RE.search(text):
         data["security_clearance"] = True
+    if _CITIZENSHIP_REQ_RE.search(text):
+        data["citizenship_requirement"] = True
 
     text_head = text_lower[:800]
     internship_role = (

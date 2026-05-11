@@ -175,6 +175,27 @@ class EvaluationEvidenceTests(unittest.TestCase):
         self.assertNotEqual(result.score, 0)
         self.assertFalse(any("citizenship" in reason.lower() and "blocked" in reason.lower() for reason in result.reasons))
 
+    def test_citizenship_requirement_is_scored_not_blocked(self) -> None:
+        jd = (
+            "Build scalable evaluations for LLM performance.\n"
+            "U.S. citizenship is required for this role.\n"
+            "Strong background in model evaluation and inference systems.\n"
+        )
+        evidence = "Built LLM evaluation harnesses and inference quality workflows."
+
+        with patch("src.evaluation._resume_evidence_text", return_value=evidence):
+            result = evaluate_job(
+                "Machine Learning Scientist",
+                jd,
+                company="Example",
+                location="Cambridge, MA",
+                source="linkedin",
+                require_us_location=False,
+            )
+
+        self.assertNotEqual(result.score, 0)
+        self.assertTrue(any("citizenship requirement detected" in reason.lower() for reason in result.reasons))
+
 
 if __name__ == "__main__":
     unittest.main()
