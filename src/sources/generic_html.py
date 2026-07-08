@@ -230,6 +230,21 @@ class GenericHTMLBoardSource(BaseSource):
         return results
 
 
+class GenericJobsHTMLBoardSource(GenericHTMLBoardSource):
+    """Conservative generic adapter that only follows job/career-like links."""
+
+    platform = "generic_html"
+    link_patterns = (
+        "/careers",
+        "/career",
+        "/jobs",
+        "/job",
+        "/positions",
+        "/openings",
+        "/roles",
+    )
+
+
 def parse_recruitee_jobs(payload: object, company: str, platform_slug: str, board_url: str) -> list[Job]:
     jobs: list[Job] = []
     raw_jobs = payload.get("offers") if isinstance(payload, dict) else payload
