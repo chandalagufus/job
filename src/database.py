@@ -31,12 +31,40 @@ from .job_intelligence import (
     score_employer_quality,
     to_structured_json,
 )
+from .scoring_policy import label_for_score
 
 log = logging.getLogger(__name__)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _score_to_grade(score: int) -> str:
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 55:
+        return "D"
+    if score >= 40:
+        return "E"
+    return "F"
+
+
+def _normalize_job_row(row: dict[str, Any]) -> dict[str, Any]:
+    try:
+        score = max(0, min(int(row.get("score") or 0), 100))
+    except (TypeError, ValueError):
+        score = 0
+    row["score"] = score
+    row["grade"] = _score_to_grade(score)
+    label = str(row.get("label") or "").strip().lower()
+    if label not in {"yes", "maybe", "no"}:
+        row["label"] = label_for_score(score)
+    return row
 
 
 class _CompatCursor:
@@ -89,6 +117,7 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS jobs (
     key          TEXT PRIMARY KEY,
     source       TEXT NOT NULL,
+    provenance   TEXT NOT NULL DEFAULT 'local',
     company      TEXT NOT NULL,
     title        TEXT NOT NULL,
     location     TEXT NOT NULL DEFAULT '',
@@ -286,6 +315,8 @@ class Database:
 
     def _ensure_schema(self) -> None:
         job_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "provenance" not in job_columns:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN provenance TEXT NOT NULL DEFAULT 'local'")
         if "grade" not in job_columns:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN grade TEXT NOT NULL DEFAULT 'F'")
         if "evaluation_json" not in job_columns:
@@ -360,8 +391,11 @@ class Database:
         pipeline_status: str = "new",
         pipeline_notes: str = "",
         follow_up_date: str = "",
+        provenance: str = "local",
     ) -> None:
         now = _now()
+        effective_posted = (posted or "").strip()
+        provenance = (provenance or "local").strip() or "local"
         description = normalize_text_encoding(description)
         canonical = canonical_key or make_canonical_key(company, title)
         structured = structured_json or to_structured_json(extract_structured_fields(title, description, location=location))
@@ -382,14 +416,25 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO jobs(
-                    key,source,company,title,location,url,posted,score,label,grade,evaluation_json,description,manual_input,fit_summary,canonical_key,structured_json,is_repost,repost_of_key,employer_quality_score,employer_quality_reason,pipeline_status,pipeline_notes,follow_up_date,pipeline_updated_at,first_seen,last_seen
+                    key,source,provenance,company,title,location,url,posted,score,label,grade,evaluation_json,description,manual_input,fit_summary,canonical_key,structured_json,is_repost,repost_of_key,employer_quality_score,employer_quality_reason,pipeline_status,pipeline_notes,follow_up_date,pipeline_updated_at,first_seen,last_seen
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(key) DO UPDATE SET
+                    provenance=CASE
+                        WHEN excluded.provenance = '' THEN jobs.provenance
+                        WHEN jobs.provenance = '' THEN excluded.provenance
+                        WHEN jobs.provenance = excluded.provenance THEN jobs.provenance
+                        WHEN instr('+' || jobs.provenance || '+', '+' || excluded.provenance || '+') > 0 THEN jobs.provenance
+                        ELSE jobs.provenance || '+' || excluded.provenance
+                    END,
                     title=excluded.title,
                     location=excluded.location,
                     url=excluded.url,
-                    posted=excluded.posted,
+                    posted=CASE
+                        WHEN jobs.posted <> '' THEN jobs.posted
+                        WHEN excluded.posted <> '' THEN excluded.posted
+                        ELSE jobs.posted
+                    END,
                     score=excluded.score,
                     label=excluded.label,
                     grade=excluded.grade,
@@ -449,7 +494,7 @@ class Database:
                     last_seen=excluded.last_seen
                 """,
                 (
-                    key, source, company, title, location, url, posted, score, label,
+                    key, source, provenance, company, title, location, url, effective_posted, score, label,
                     grade, evaluation_json, description, 1 if manual_input else 0, fit_summary,
                     canonical, structured, 1 if repost_flag else 0, repost_key, quality_score, quality_reason,
                     pipeline_status, pipeline_notes, follow_up_date, now, now, now,
@@ -568,6 +613,7 @@ class Database:
         rows = self._conn.execute(
             """
             SELECT key, source, company, title, location, url, posted, score, label, grade,
+                   provenance,
                    evaluation_json, description, manual_input, fit_summary, canonical_key,
                    structured_json, is_repost, repost_of_key, employer_quality_score, employer_quality_reason, pipeline_status,
                    pipeline_notes, follow_up_date, pipeline_updated_at, first_seen, last_seen
@@ -577,11 +623,12 @@ class Database:
             """,
             (max(limit, 1),),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_normalize_job_row(dict(r)) for r in rows]
 
     def list_jobs_for_board(self, limit: Optional[int] = 1000) -> list[dict]:
         query = """
             SELECT key, source, company, title, location, url, posted, score, label, grade,
+                   provenance,
                    evaluation_json, description, manual_input, fit_summary, canonical_key,
                    structured_json, is_repost, repost_of_key, employer_quality_score, employer_quality_reason, pipeline_status,
                    pipeline_notes, follow_up_date, pipeline_updated_at, first_seen, last_seen
@@ -600,12 +647,13 @@ class Database:
             query += "\n            LIMIT ?"
             params = (max(limit, 1),)
         rows = self._conn.execute(query, params).fetchall()
-        return [dict(r) for r in rows]
+        return [_normalize_job_row(dict(r)) for r in rows]
 
     def get_job(self, key: str) -> Optional[dict]:
         row = self._conn.execute(
             """
             SELECT key, source, company, title, location, url, posted, score, label, grade,
+                   provenance,
                    evaluation_json, description, manual_input, fit_summary, canonical_key,
                    structured_json, is_repost, repost_of_key, employer_quality_score, employer_quality_reason, pipeline_status,
                    pipeline_notes, follow_up_date, pipeline_updated_at, first_seen, last_seen
@@ -614,7 +662,7 @@ class Database:
             """,
             (key,),
         ).fetchone()
-        return dict(row) if row is not None else None
+        return _normalize_job_row(dict(row)) if row is not None else None
 
     def update_job_evaluation(
         self,
@@ -889,6 +937,7 @@ class Database:
         board_id: str,
         *,
         empty_fail_threshold: int = 3,
+        broken_fail_threshold: int = 2,
         cooldown_hours: int = 168,
     ) -> bool:
         with self._lock:
@@ -898,17 +947,24 @@ class Database:
             ).fetchone()
         if row is None:
             return False
-        if row["status"] != "degraded":
-            return False
-        if int(row["fail_count"] or 0) < max(empty_fail_threshold, 1):
-            return False
-        if str(row["fail_reason"] or "").strip() != "0 jobs returned":
-            return False
+        status = str(row["status"] or "").strip().lower()
+        fail_count = int(row["fail_count"] or 0)
         try:
             last_checked = datetime.fromisoformat(str(row["last_checked"] or ""))
         except ValueError:
             return False
-        return (datetime.now(timezone.utc) - last_checked).total_seconds() < max(cooldown_hours, 1) * 3600
+        within_cooldown = (datetime.now(timezone.utc) - last_checked).total_seconds() < max(cooldown_hours, 1) * 3600
+        if not within_cooldown:
+            return False
+        if status == "degraded":
+            if fail_count < max(empty_fail_threshold, 1):
+                return False
+            if str(row["fail_reason"] or "").strip() != "0 jobs returned":
+                return False
+            return True
+        if status == "broken":
+            return fail_count >= max(broken_fail_threshold, 1)
+        return False
 
     def was_board_checked_recently(self, board_id: str, *, cooldown_hours: int = 6) -> bool:
         if int(cooldown_hours or 0) <= 0:
@@ -946,7 +1002,7 @@ class Database:
                 "SELECT fail_count FROM boards WHERE board_id=?", (board_id,)
             ).fetchone()
             fail_count = 0
-            if existing and status in {"dead", "degraded"}:
+            if existing and status in {"dead", "degraded", "broken"}:
                 fail_count = existing["fail_count"] + 1
             conn.execute(
                 """
@@ -972,9 +1028,10 @@ class Database:
     def get_board_stats(self) -> dict:
         total = self._conn.execute("SELECT COUNT(*) FROM boards").fetchone()[0]
         dead = self._conn.execute("SELECT COUNT(*) FROM boards WHERE status='dead'").fetchone()[0]
+        broken = self._conn.execute("SELECT COUNT(*) FROM boards WHERE status='broken'").fetchone()[0]
         degraded = self._conn.execute("SELECT COUNT(*) FROM boards WHERE status='degraded'").fetchone()[0]
         active = self._conn.execute("SELECT COUNT(*) FROM boards WHERE status='active'").fetchone()[0]
-        return {"total": total, "active": active, "degraded": degraded, "dead": dead}
+        return {"total": total, "active": active, "degraded": degraded, "broken": broken, "dead": dead}
 
     def list_boards(self, *, limit: int = 2000, status: str = "", platform: str = "") -> list[dict]:
         sql = [
@@ -996,8 +1053,9 @@ class Database:
             ORDER BY
                 CASE status
                     WHEN 'dead' THEN 0
-                    WHEN 'degraded' THEN 1
-                    WHEN 'active' THEN 2
+                    WHEN 'broken' THEN 1
+                    WHEN 'degraded' THEN 2
+                    WHEN 'active' THEN 3
                     ELSE 3
                 END,
                 last_checked DESC,
@@ -1122,29 +1180,36 @@ class Database:
         items: list[dict] = []
         for (_source_key, _entity_type), rows in grouped.items():
             latest = rows[0]
+            basis = latest
+            if latest["status"] == "skipped" and str(latest["error_text"] or "").startswith("Skipped because board was checked within"):
+                basis = next((row for row in rows[1:] if row["status"] != "skipped"), latest)
             recent = rows[:10]
             successes = [row for row in recent if row["status"] == "success"]
             last_success = next((row["finished_at"] for row in rows if row["status"] == "success"), "")
             last_error = next((row["error_text"] for row in rows if row["status"] != "success" and row["error_text"]), "")
             failure_streak = 0
-            latest_jd_coverage = float(latest["jd_coverage"] or 0.0)
-            latest_fetched = int(latest["fetched_count"] or 0)
+            latest_jd_coverage = float(basis["jd_coverage"] or 0.0)
+            latest_fetched = int(basis["fetched_count"] or 0)
             for row in rows:
-                if row["status"] == "success":
+                if row["status"] in {"success", "empty"}:
                     break
+                if row["status"] == "skipped" and str(row["error_text"] or "").startswith("Skipped because board was checked within"):
+                    continue
                 failure_streak += 1
             success_rate = (100.0 * len(successes) / len(recent)) if recent else 0.0
             avg_latency = sum(int(row["latency_ms"] or 0) for row in recent) / len(recent) if recent else 0.0
             avg_fetched = sum(int(row["fetched_count"] or 0) for row in recent) / len(recent) if recent else 0.0
-            if latest["status"] == "success":
+            if basis["status"] == "success":
                 health = "healthy"
-            elif latest["status"] in {"empty", "skipped"}:
+            elif basis["status"] == "skipped":
+                health = "degraded" if not last_success else "healthy"
+            elif basis["status"] == "empty":
                 health = "degraded"
             else:
                 health = "broken"
-            if latest["entity_type"] == "main" and latest["status"] == "success" and latest_fetched >= 10 and latest_jd_coverage < 5.0:
+            if basis["entity_type"] == "main" and basis["status"] == "success" and latest_fetched >= 10 and latest_jd_coverage < 5.0:
                 health = "degraded"
-            if failure_streak >= 2 and latest["status"] not in {"success", "empty", "skipped"}:
+            if failure_streak >= 2 and basis["status"] not in {"success", "empty", "skipped"}:
                 health = "broken"
 
             item = {
@@ -1155,16 +1220,17 @@ class Database:
                 "company": latest["company"],
                 "url": latest["url"],
                 "latest_status": latest["status"],
+                "basis_status": basis["status"],
                 "health": health,
                 "latest_started_at": latest["started_at"],
                 "latest_finished_at": latest["finished_at"],
                 "latest_latency_ms": int(latest["latency_ms"] or 0),
                 "latest_fetched_count": latest_fetched,
-                "latest_matched_count": int(latest["matched_count"] or 0),
-                "latest_new_count": int(latest["new_count"] or 0),
-                "latest_yes_count": int(latest["yes_count"] or 0),
-                "latest_maybe_count": int(latest["maybe_count"] or 0),
-                "latest_stale_count": int(latest["stale_count"] or 0),
+                "latest_matched_count": int(basis["matched_count"] or 0),
+                "latest_new_count": int(basis["new_count"] or 0),
+                "latest_yes_count": int(basis["yes_count"] or 0),
+                "latest_maybe_count": int(basis["maybe_count"] or 0),
+                "latest_stale_count": int(basis["stale_count"] or 0),
                 "latest_jd_coverage": latest_jd_coverage,
                 "failure_streak": failure_streak,
                 "last_success_at": last_success,
@@ -1197,15 +1263,20 @@ class Database:
         broken = sum(1 for row in health_rows if row["health"] == "broken")
         cutoff = datetime.now(timezone.utc).timestamp() - 86400
         failures_24h = 0
+        empty_24h = 0
+        skipped_24h = 0
         for row in self.list_source_runs(limit=5000):
-            if row["status"] == "success":
-                continue
             try:
                 finished = datetime.fromisoformat(str(row["finished_at"]).replace("Z", "+00:00"))
                 if finished.tzinfo is None:
                     finished = finished.replace(tzinfo=timezone.utc)
                 if finished.timestamp() >= cutoff:
-                    failures_24h += 1
+                    if row["status"] == "error":
+                        failures_24h += 1
+                    elif row["status"] == "empty":
+                        empty_24h += 1
+                    elif row["status"] == "skipped":
+                        skipped_24h += 1
             except Exception:
                 continue
         return {
@@ -1214,6 +1285,8 @@ class Database:
             "degraded": degraded,
             "broken": broken,
             "failures_24h": failures_24h,
+            "empty_24h": empty_24h,
+            "skipped_24h": skipped_24h,
         }
 
     # -------------------------------------------------------------------------
@@ -1229,11 +1302,25 @@ class Database:
         except ValueError:
             return 0
 
+    def get_cursor_value(self, name: str, default: str = "") -> str:
+        row = self._conn.execute("SELECT value FROM cursors WHERE name=?", (name,)).fetchone()
+        if row is None:
+            return default
+        value = row["value"]
+        return default if value is None else str(value)
+
     def set_cursor(self, name: str, value: int) -> None:
         with self._tx() as conn:
             conn.execute(
                 "INSERT INTO cursors(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
                 (name, str(max(value, 0))),
+            )
+
+    def set_cursor_value(self, name: str, value: str) -> None:
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO cursors(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                (name, "" if value is None else str(value)),
             )
 
     # -------------------------------------------------------------------------
