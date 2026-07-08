@@ -1,4 +1,4 @@
-"""Structured job-fit evaluation with weighted dimensions and letter grades."""
+﻿"""Structured job-fit evaluation with weighted dimensions and letter grades."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -21,7 +21,11 @@ from .scoring_policy import DEFAULT_MAYBE_THRESHOLD, DEFAULT_YES_THRESHOLD, labe
 from .sources.base import is_us_location, remote_scope_status
 
 EVAL_CFG = Config.load()
+EVALUATION_PAYLOAD_VERSION = 2
 ROOT_DIR = Path(__file__).resolve().parents[1]
+CANDIDATE_EXPERIENCE_YEARS = int(PROFILE.get("experience_years") or 3)
+TARGET_EXPERIENCE_MAX_YEARS = max(4, CANDIDATE_EXPERIENCE_YEARS + 1)
+TARGET_EXPERIENCE_RANGE_LABEL = f"1-{TARGET_EXPERIENCE_MAX_YEARS} year target range"
 LOCAL_CANDIDATE_EVIDENCE_PATH = ROOT_DIR / "data" / "resume" / "candidate_evidence.local.md"
 CANDIDATE_EVIDENCE_PATH = ROOT_DIR / "data" / "resume" / "candidate_evidence.md"
 LOCAL_BASE_RESUME_PATH = ROOT_DIR / "data" / "resume" / "base_resume.local.md"
@@ -53,6 +57,15 @@ CRITICAL_SKILL_HINTS = (
     "must",
     "need ",
     "needs ",
+)
+OPTIONAL_PORTFOLIO_CONTEXT_HINTS = (
+    "if you have code",
+    "if you have written",
+    "please share",
+    "open domain",
+    "for example github",
+    "github)",
+    "github )",
 )
 SKILL_EVIDENCE_ALIASES: dict[str, tuple[str, ...]] = {
     "apache spark": ("apache spark", "spark", "pyspark"),
@@ -139,6 +152,18 @@ EVAL_CLEARANCE_CONTEXT_REGEXES: tuple[str, ...] = (
     r"\bclearance\s+eligible\b",
     r"\bactive\s+(?:secret|top\s+secret|ts[/\s\-]?sci)\b",
 )
+VISA_SPONSORSHIP_BLOCK_REGEXES: tuple[str, ...] = (
+    r"\bnot\s+offering\s+visa\s+sponsorship\b",
+    r"\bno\s+visa\s+sponsorship\b",
+    r"\bunable\s+to\s+sponsor\b",
+    r"\bwill\s+not\s+sponsor\b",
+    r"\bdoes\s+not\s+offer\s+visa\s+sponsorship\b",
+    r"\bno\s+(?:employment|work)\s+visa\s+sponsorship\b",
+    r"\bvisa\s+sponsorship\s+(?:is\s+)?not\s+available\b",
+    r"\bvisa\s+sponsorship\s+(?:is\s+)?unavailable\b",
+    r"\bnot\s+eligible\s+for\s+visa\s+sponsorship\b",
+    r"\bmust\s+have\s+current\s+authorization\s+to\s+work\b",
+)
 
 
 @dataclass
@@ -169,6 +194,7 @@ class EvaluationResult:
 
     def to_dict(self) -> dict:
         return {
+            "version": EVALUATION_PAYLOAD_VERSION,
             "score": self.score,
             "label": self.label,
             "grade": self.grade,
@@ -300,6 +326,10 @@ def _skill_requirement_level(skill: str, description: str) -> str:
             continue
         if not any(_phrase_match(sentence, alias) for alias in aliases):
             continue
+        if skill == "github":
+            lowered_sentence = sentence.lower()
+            if any(hint in lowered_sentence for hint in OPTIONAL_PORTFOLIO_CONTEXT_HINTS):
+                return "preferred"
         if any(hint in sentence for hint in CRITICAL_SKILL_HINTS):
             return "required"
     return "mentioned"
@@ -438,10 +468,63 @@ def _clearance_signal_reason(title: str, text: str) -> str:
     return ""
 
 
+def _visa_sponsorship_block_reason(text: str) -> str:
+    if not PROFILE.get("needs_visa_sponsorship", False):
+        return ""
+    full_text = (text or "").strip().lower()
+    if not full_text:
+        return ""
+    for pattern in VISA_SPONSORSHIP_BLOCK_REGEXES:
+        match = re.search(pattern, full_text)
+        if match:
+            return f"Blocked because the posting does not offer visa sponsorship: {match.group(0)}."
+    return ""
+
+
 def _find_seniority_token(text: str) -> str:
     for token in SENIORITY_TOKENS:
         if re.search(rf"\b{re.escape(token)}\b", text):
             return token
+    return ""
+
+
+def _find_title_seniority_token(title: str) -> str:
+    return _find_seniority_token((title or "").strip().lower())
+
+
+def _has_junior_title_signal(title: str) -> bool:
+    normalized = (title or "").strip().lower()
+    junior_tokens = (
+        "junior",
+        "jr",
+        "entry level",
+        "entry-level",
+        "new grad",
+        "graduate",
+        "early career",
+        "intern",
+        "apprentice",
+        "associate",
+    )
+    return any(re.search(rf"\b{re.escape(token)}\b", normalized) for token in junior_tokens)
+
+
+def _body_seniority_signal(text: str) -> str:
+    normalized = (text or "").strip().lower()
+    explicit_patterns = (
+        r"\bsenior[\s\-]+level\b",
+        r"\bstaff[\s\-]+level\b",
+        r"\bprincipal[\s\-]+level\b",
+        r"\blead[\s\-]+role\b",
+        r"\bmanager[\s\-]+role\b",
+        r"\bthis\s+is\s+a\s+senior\b",
+        r"\bthis\s+is\s+a\s+lead\b",
+        r"\bthis\s+is\s+a\s+staff\b",
+        r"\bthis\s+is\s+a\s+principal\b",
+    )
+    for pattern in explicit_patterns:
+        if re.search(pattern, normalized):
+            return pattern
     return ""
 
 
@@ -465,28 +548,79 @@ def _source_is_strong_first_party(source: str) -> bool:
 
 
 def _extract_years_requirement(text: str) -> int:
-    matches = re.findall(
-        r"\b(\d{1,2})\+?\s*(?:-|to|–|—)?\s*(\d{1,2})?\s+years?\s+(?:of\s+)?(?:experience|exp)\b",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if not matches:
+    normalized = (text or "").replace("–", "-").replace("—", "-")
+    if not normalized:
         return 0
     mins: list[int] = []
-    for low, _high in matches:
+
+    # Treat ranges by their minimum accepted experience, e.g. "4-7+ years" is a
+    # 4-year minimum, not a 7-year hard requirement.
+    range_pattern = re.compile(
+        r"\b(\d{1,2})\s*(?:-|to)\s*(\d{1,2})\+?\s+years?\s+(?:of\s+)?(?:experience|exp)\b",
+        flags=re.IGNORECASE,
+    )
+    masked = normalized
+    for match in range_pattern.finditer(normalized):
         try:
-            mins.append(int(low))
+            mins.append(int(match.group(1)))
+        except ValueError:
+            pass
+        masked = masked[: match.start()] + (" " * (match.end() - match.start())) + masked[match.end() :]
+
+    standalone_pattern = re.compile(
+        r"\b(\d{1,2})\+?\s+years?\s+(?:of\s+)?(?:experience|exp)\b",
+        flags=re.IGNORECASE,
+    )
+    for match in standalone_pattern.finditer(masked):
+        try:
+            mins.append(int(match.group(1)))
         except ValueError:
             continue
     return max(mins) if mins else 0
 
 
-def _dimension_title_fit(title: str) -> tuple[int, str]:
+def _content_alignment_strength(
+    matched_strong: list[str],
+    matched_moderate: list[str],
+    assessment: SkillEvidenceAssessment,
+) -> str:
+    supported_strong = len(assessment.supported_strong)
+    supported_moderate = len(assessment.supported_moderate)
+    if assessment.critical_skill_gaps:
+        return "weak"
+    if supported_strong >= 3:
+        return "strong"
+    if supported_strong >= 2 and supported_moderate >= 1:
+        return "strong"
+    if supported_strong >= 1 and supported_moderate >= 3:
+        return "strong"
+    if supported_strong >= 1 or supported_moderate >= 2:
+        return "moderate"
+    if matched_strong or matched_moderate:
+        return "light"
+    return "weak"
+
+
+def _dimension_title_fit(
+    title: str,
+    matched_strong: list[str],
+    matched_moderate: list[str],
+    assessment: SkillEvidenceAssessment,
+) -> tuple[int, str]:
     title_result = classify(title)
+    content_strength = _content_alignment_strength(matched_strong, matched_moderate, assessment)
     if title_result.label == "yes":
         return 92, "The title is strongly aligned with your target roles."
     if title_result.label == "maybe":
+        if content_strength == "strong":
+            return 78, "The title is adjacent, and the skills plus JD work content are strongly aligned."
+        if content_strength == "moderate":
+            return 72, "The title is adjacent, and the skills plus JD work content support the match."
         return 65, "The title is adjacent to your target roles but needs review."
+    if content_strength == "strong":
+        return 58, "The title is off-target, but the skills and JD work content are strongly aligned."
+    if content_strength == "moderate":
+        return 42, "The title is weaker than your target roles, but the skills and JD work content are reasonably aligned."
     return 20, "The title is weak or ambiguous for your target role set."
 
 
@@ -531,23 +665,39 @@ def _dimension_target_alignment(role_hits: list[str]) -> tuple[int, str]:
     return 30, "The posting does not explicitly mention your preferred role families."
 
 
-def _dimension_seniority(text: str) -> tuple[int, str]:
+def _dimension_seniority(title: str, text: str) -> tuple[int, str]:
     years_required = _extract_years_requirement(text)
-    if years_required > 3:
-        return 5, f"The posting requires {years_required}+ years of experience, which is above your target range."
-    token = _find_seniority_token(text)
-    if not token:
+    if years_required > TARGET_EXPERIENCE_MAX_YEARS:
+        return 5, (
+            f"The posting requires {years_required}+ years of experience, which is above your "
+            f"{TARGET_EXPERIENCE_RANGE_LABEL}."
+        )
+    if years_required == TARGET_EXPERIENCE_MAX_YEARS:
+        return 62, (
+            f"The posting requires {years_required}+ years of experience, a reasonable stretch for a "
+            f"{CANDIDATE_EXPERIENCE_YEARS}-year profile."
+        )
+    if _has_junior_title_signal(title):
+        return 92, "The title signals an early-career role, which fits your current experience range."
+    title_token = _find_title_seniority_token(title)
+    if title_token:
+        if title_token in VERY_SENIOR:
+            return 10, f"The title looks far above your target level because it mentions {title_token}."
+        return 45, f"The title may be slightly above your target level because it mentions {title_token}."
+    body_signal = _body_seniority_signal(text)
+    if not body_signal:
         return 85, "The role does not appear overly senior from the visible text."
-    if token in VERY_SENIOR:
-        return 10, f"The posting looks far above your target level because it mentions {token}."
-    return 45, f"The posting may be slightly above your target level because it mentions {token}."
+    return 45, "The posting language suggests a somewhat senior role."
 
 
 def _experience_penalty(text: str) -> tuple[int, str]:
     years_required = _extract_years_requirement(text)
-    if years_required <= 3:
+    if years_required <= TARGET_EXPERIENCE_MAX_YEARS:
         return 0, ""
-    return 100, f"Blocked because the role requires {years_required}+ years of experience, above your 0-3 year target range."
+    return 100, (
+        f"Blocked because the role requires {years_required}+ years of experience, above your "
+        f"{TARGET_EXPERIENCE_RANGE_LABEL}."
+    )
 
 
 def _location_block(location: str, text: str, *, require_us_location: bool) -> str:
@@ -679,9 +829,14 @@ def _resume_gap_score_cap(assessment: SkillEvidenceAssessment) -> tuple[int, str
 
 
 def _dimension_risk(text: str) -> tuple[int, str]:
+    sponsorship_block = _visa_sponsorship_block_reason(text)
+    if sponsorship_block:
+        return 0, sponsorship_block
     risk_flag = _clearance_signal_reason("", text)
     if risk_flag:
         return 18, risk_flag
+    if PROFILE.get("needs_visa_sponsorship", False):
+        return 92, "No clearance, citizenship, or sponsorship blockers were detected."
     return 92, "No clearance or citizenship blockers were detected."
 
 
@@ -754,8 +909,11 @@ def evaluate_job(
         )
 
     years_required = _extract_years_requirement(text)
-    if years_required >= 4:
-        block_reason = f"Blocked because the role requires {years_required}+ years of experience, above your 0-3 year target range."
+    if years_required > TARGET_EXPERIENCE_MAX_YEARS:
+        block_reason = (
+            f"Blocked because the role requires {years_required}+ years of experience, above your "
+            f"{TARGET_EXPERIENCE_RANGE_LABEL}."
+        )
         dimensions = [
             EvaluationDimension("seniority_fit", 0.10, 0, block_reason),
             EvaluationDimension("title_fit", 0.25, 0, "Evaluation stopped because the experience requirement is above your target range."),
@@ -779,11 +937,36 @@ def evaluate_job(
             dimensions=dimensions,
         )
 
+    sponsorship_block = _visa_sponsorship_block_reason(text)
+    if sponsorship_block:
+        dimensions = [
+            EvaluationDimension("risk", 0.10, 0, sponsorship_block),
+            EvaluationDimension("title_fit", 0.25, 0, "Evaluation stopped because the posting does not offer visa sponsorship."),
+            EvaluationDimension("skill_overlap", 0.25, 0, "Evaluation stopped because the posting does not offer visa sponsorship."),
+            EvaluationDimension("target_alignment", 0.15, 0, "Evaluation stopped because the posting does not offer visa sponsorship."),
+            EvaluationDimension("seniority_fit", 0.10, 0, "Evaluation stopped because the posting does not offer visa sponsorship."),
+            EvaluationDimension("location_fit", 0.05, 0, "Evaluation stopped because the posting does not offer visa sponsorship."),
+            EvaluationDimension("evidence_quality", 0.10, 0, "Evaluation stopped because the posting does not offer visa sponsorship."),
+        ]
+        return EvaluationResult(
+            score=0,
+            label="no",
+            grade="F",
+            matched_strong=matched_strong,
+            matched_moderate=matched_moderate,
+            unsupported_strong=assessment.unsupported_strong,
+            unsupported_moderate=assessment.unsupported_moderate,
+            critical_skill_gaps=assessment.critical_skill_gaps,
+            reasons=[sponsorship_block],
+            fit_summary=sponsorship_block,
+            dimensions=dimensions,
+        )
+
     dimensions = [
-        EvaluationDimension("title_fit", 0.25, *_dimension_title_fit(title)),
+        EvaluationDimension("title_fit", 0.25, *_dimension_title_fit(title, matched_strong, matched_moderate, assessment)),
         EvaluationDimension("skill_overlap", 0.25, *_dimension_skill_overlap(matched_strong, matched_moderate, strong_points, moderate_points, assessment)),
         EvaluationDimension("target_alignment", 0.15, *_dimension_target_alignment(role_hits)),
-        EvaluationDimension("seniority_fit", 0.10, *_dimension_seniority(text)),
+        EvaluationDimension("seniority_fit", 0.10, *_dimension_seniority(title, text)),
         EvaluationDimension("location_fit", 0.05, *_dimension_location(location, text)),
         EvaluationDimension("evidence_quality", 0.10, *_dimension_evidence(description, matched_strong, matched_moderate, assessment)),
         EvaluationDimension("risk", 0.10, *_dimension_risk(text)),
