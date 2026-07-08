@@ -50,6 +50,8 @@ from .sources.apple import AppleSource
 from .sources.netflix import NetflixSource
 from .sources.stripe import StripeSource
 from .sources.linkedin import LinkedInSource
+from .sources.google_x import GoogleXSource
+from .sources.tiktok_usds import TikTokUSDSSource
 from .sources.greenhouse import GreenhouseSource, _board_id as gh_board_id
 from .sources.lever import LeverSource, _board_id as lever_board_id
 from .sources.smartrecruiters import SmartRecruitersSource, _board_id as sr_board_id
@@ -65,6 +67,7 @@ from .sources.dover import DoverSource, _board_id as dover_board_id
 from .sources.gem import GemSource, _board_id as gem_board_id
 from .sources.wellfound import WellfoundSource, _board_id as wellfound_board_id
 from .sources.workatastartup import WorkAtAStartupSource, _board_id as workatastartup_board_id
+from .sources.generic_html import GenericJobsHTMLBoardSource, board_id as generic_html_board_id
 from .webapp import serve_web
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -73,6 +76,7 @@ ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 SUPPORTED_BOARD_PLATFORMS = (
     "greenhouse", "lever", "smartrecruiters", "workday", "ashby", "workable", "jobvite", "icims",
     "recruitee", "breezyhr", "teamtailor", "dover", "gem", "wellfound", "workatastartup",
+    "generic_html",
 )
 
 log = logging.getLogger(__name__)
@@ -139,6 +143,34 @@ def _web_port_responding(host: str, port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def _active_git_maintenance_markers(repo_root: str) -> list[str]:
+    repo_path = Path(repo_root)
+    git_dir = repo_path / ".git"
+    if not git_dir.exists():
+        return []
+    markers: list[tuple[str, Path]] = [
+        ("index.lock", git_dir / "index.lock"),
+        ("HEAD.lock", git_dir / "HEAD.lock"),
+        ("rebase-apply", git_dir / "rebase-apply"),
+        ("rebase-merge", git_dir / "rebase-merge"),
+        ("MERGE_HEAD", git_dir / "MERGE_HEAD"),
+        ("CHERRY_PICK_HEAD", git_dir / "CHERRY_PICK_HEAD"),
+        ("REVERT_HEAD", git_dir / "REVERT_HEAD"),
+        ("BISECT_LOG", git_dir / "BISECT_LOG"),
+    ]
+    return [name for name, path in markers if path.exists()]
+
+
+def _public_export_git_maintenance_markers(repo_root: str) -> list[str]:
+    root = Path(repo_root)
+    public_export = (root / "public-export").resolve()
+    if public_export == root.resolve():
+        return _active_git_maintenance_markers(str(public_export))
+    if not public_export.exists():
+        return []
+    return _active_git_maintenance_markers(str(public_export))
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -345,13 +377,16 @@ def _load_structured_json(raw: str) -> dict:
 
 
 def _dimension_score(evaluation, name: str) -> int:
-    for dim in evaluation.dimensions:
+    for dim in getattr(evaluation, "dimensions", []) or []:
         if dim.name == name:
             return int(dim.score)
     return 0
 
 
 def _resume_match_score(evaluation) -> int:
+    """Expose a separate resume-vs-JD signal from the richer evaluator."""
+    if not getattr(evaluation, "dimensions", None):
+        return max(0, min(100, int(getattr(evaluation, "score", 0) or 0)))
     evidence = _dimension_score(evaluation, "evidence_quality")
     overlap = _dimension_score(evaluation, "skill_overlap")
     return max(0, min(100, round(0.6 * evidence + 0.4 * overlap)))
@@ -359,6 +394,20 @@ def _resume_match_score(evaluation) -> int:
 
 def _relabel(score: int, thresholds) -> str:
     return label_for_score(score, yes_threshold=thresholds.yes, maybe_threshold=thresholds.maybe)
+
+
+def _grade_for_score(score: int) -> str:
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 55:
+        return "D"
+    if score >= 40:
+        return "E"
+    return "F"
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +440,10 @@ def _build_main_sources(cfg: Config) -> list[object]:
         sources.append(StripeSource(max_jobs=cfg.source("stripe").max_jobs))
     if cfg.source("linkedin").enabled:
         sources.append(LinkedInSource(max_jobs=cfg.source("linkedin").max_jobs))
+    if cfg.source("google_x").enabled:
+        sources.append(GoogleXSource(max_jobs=cfg.source("google_x").max_jobs))
+    if cfg.source("tiktok_usds").enabled:
+        sources.append(TikTokUSDSSource(max_jobs=cfg.source("tiktok_usds").max_jobs))
     return sources
 
 
@@ -659,6 +712,7 @@ _BOARD_SEMAPHORES: dict[str, threading.Semaphore] = {
     "gem": threading.Semaphore(6),
     "wellfound": threading.Semaphore(4),
     "workatastartup": threading.Semaphore(4),
+    "generic_html": threading.Semaphore(4),
 }
 
 
@@ -679,6 +733,7 @@ def run_boards(
     max_iterations: int = 2000,
     export_dead_csv: str = "",
     show_live_progress: bool = True,
+    cursor_key: str = "boards_main",
  ) -> dict:
     if not db.get_feature_flags({"scanner_boards": cfg.features.scanner_boards})["scanner_boards"]:
         log.warning("scanner_boards feature is disabled. Skipping boards mode run.")
@@ -703,7 +758,6 @@ def run_boards(
         " ".join(f"{p}={c}" for p, c in sorted(platform_counts.items())),
     )
 
-    cursor_key = "boards_main"
     n = len(boards)
 
     def run_one_batch() -> int:
@@ -798,6 +852,7 @@ def run_boards(
         new_cursor = end if end < n else 0
         if not dry_run:
             db.set_cursor(cursor_key, new_cursor)
+            db.set_cursor_value(f"{cursor_key}_updated_at", datetime.now(timezone.utc).isoformat())
             if export_dead_csv:
                 db.export_dead_boards_csv(export_dead_csv)
 
@@ -900,6 +955,8 @@ def _board_source_for(b: dict) -> Optional[object]:
         return WellfoundSource(company, url)
     if platform == "workatastartup":
         return WorkAtAStartupSource(company, url)
+    if platform == "generic_html":
+        return GenericJobsHTMLBoardSource(company, url)
     return None
 
 
@@ -936,6 +993,8 @@ def _get_board_id(b: dict) -> str:
         return wellfound_board_id(url)
     if platform == "workatastartup":
         return workatastartup_board_id(url)
+    if platform == "generic_html":
+        return generic_html_board_id("generic_html", url)
     return f"{platform}:"
 
 
@@ -975,8 +1034,8 @@ def _process_one_board(
     if db.is_board_dead(board_id):
         return [], None, _record(status="error", jobs=[], error_text="Board marked dead")
     if db.should_skip_board(board_id):
-        log.debug("Skipping board with repeated empty runs: %s", board_id)
-        return [], None, _record(status="skipped", jobs=[], error_text="Skipped after repeated empty runs")
+        log.debug("Skipping board with repeated recent failures: %s", board_id)
+        return [], None, _record(status="skipped", jobs=[], error_text="Skipped after repeated recent failures")
     if db.was_board_checked_recently(board_id, cooldown_hours=board_rescan_cooldown_hours):
         log.debug("Skipping recently checked board: %s", board_id)
         return [], None, _record(
@@ -1021,10 +1080,26 @@ def _process_one_board(
             error_text = f"DEAD {board_id}: HTTP {status}"
             return [], error_text, _record(status="error", jobs=[], error_text=error_text)
         error_text = f"{board_id}: HTTPError {status}: {exc}"
+        db.upsert_board(
+            board_id=board_id,
+            platform=platform,
+            company=company,
+            url=url,
+            status="broken",
+            fail_reason=error_text[:500],
+        )
         return [], error_text, _record(status="error", jobs=[], error_text=error_text)
 
     except Exception as exc:
         error_text = f"{board_id}: {type(exc).__name__}: {exc}"
+        db.upsert_board(
+            board_id=board_id,
+            platform=platform,
+            company=company,
+            url=url,
+            status="broken",
+            fail_reason=error_text[:500],
+        )
         return [], error_text, _record(status="error", jobs=[], error_text=error_text)
 
 
@@ -1070,7 +1145,8 @@ def _dispatch_results(
     if dupes:
         log.info("Dedup: removed %d duplicate(s)", dupes)
 
-    feedback_rows = db.get_feedback_jobs()
+    get_feedback_jobs = getattr(db, "get_feedback_jobs", None)
+    feedback_rows = get_feedback_jobs() if callable(get_feedback_jobs) else []
     thresholds = calibrate_thresholds(feedback_rows)
     if thresholds.calibrated:
         log.info(
@@ -1153,6 +1229,8 @@ def _dispatch_results(
     for j in matched:
         adjustment = feedback_adjustments.get(j.key)
         if adjustment is None:
+            continue
+        if not adjustment.delta and not adjustment.reasons:
             continue
         if adjustment.delta:
             feedback_adjusted += 1
@@ -1238,14 +1316,21 @@ def _dispatch_results(
                 yes_threshold=thresholds.yes,
                 maybe_threshold=thresholds.maybe,
             )
+            evaluation_payload = evaluation.to_dict()
+            evaluation_payload["score"] = int(j.score)
+            evaluation_payload["label"] = str(j.label)
+            evaluation_payload["grade"] = _grade_for_score(int(j.score))
+            evaluation_payload["fit_summary"] = f"Grade {evaluation_payload['grade']} ({int(j.score)}/100). " + " ".join(
+                str(reason) for reason in evaluation_payload.get("reasons", [])[:3]
+            )
             db.mark_job_seen(
                 key=j.key, source=j.source, company=j.company, title=j.title,
                 location=j.location, url=j.url, posted=j.posted,
                 score=j.score, label=j.label,
-                grade=evaluation.grade,
-                evaluation_json=evaluation.to_json(),
+                grade=evaluation_payload["grade"],
+                evaluation_json=json.dumps(evaluation_payload, ensure_ascii=True, sort_keys=True),
                 description=j.description,
-                fit_summary=evaluation.fit_summary,
+                fit_summary=evaluation_payload["fit_summary"],
                 canonical_key=getattr(j, "canonical_key", ""),
                 structured_json=getattr(j, "structured_json", ""),
                 is_repost=bool(getattr(j, "is_repost", False)),
@@ -1476,6 +1561,14 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.mode == "web":
         if _web_port_responding(args.web_host, args.web_port):
             log.warning("A web server is already responding at http://%s:%d", args.web_host, args.web_port)
+            return
+        maintenance_markers = _public_export_git_maintenance_markers(str(Path(ROOT_DIR)))
+        if maintenance_markers:
+            log.warning(
+                "Web mode refused to start: public-export has active git maintenance markers (%s). "
+                "Finish the git operation or remove the stale lock before opening the dashboard.",
+                ", ".join(maintenance_markers),
+            )
             return
         if not args.web_no_git_sync:
             _auto_sync_repo_before_web(repo_root=str(Path(ROOT_DIR)), branch="main")
