@@ -51,7 +51,7 @@ class BoardsConfig:
     batch_size: int = 50
     workers: int = 12
     timeout: int = 30
-    rescan_cooldown_hours: int = 0
+    rescan_cooldown_hours: int = 1
 
 
 @dataclass
@@ -126,16 +126,16 @@ class Config:
         )
 
         # HTTP timeout
-        cfg.http_timeout = int(os.environ.get("HTTP_TIMEOUT", raw.get("http_timeout", 30)))
+        cfg.http_timeout = _int_env("HTTP_TIMEOUT", raw.get("http_timeout", 30))
 
         # Boards
         bo = raw.get("boards", {}) or {}
         cfg.boards.csv = os.environ.get("BOARDS_CSV", bo.get("csv", ""))
-        cfg.boards.batch_size = int(os.environ.get("BOARDS_BATCH_SIZE", bo.get("batch_size", 50)))
-        cfg.boards.workers = int(os.environ.get("BOARDS_WORKERS", bo.get("workers", 12)))
-        cfg.boards.timeout = int(os.environ.get("BOARDS_TIMEOUT", bo.get("timeout", 30)))
-        cfg.boards.rescan_cooldown_hours = int(
-            os.environ.get("BOARDS_RESCAN_COOLDOWN_HOURS", bo.get("rescan_cooldown_hours", 0))
+        cfg.boards.batch_size = _int_env("BOARDS_BATCH_SIZE", bo.get("batch_size", 50))
+        cfg.boards.workers = _int_env("BOARDS_WORKERS", bo.get("workers", 12))
+        cfg.boards.timeout = _int_env("BOARDS_TIMEOUT", bo.get("timeout", 30))
+        cfg.boards.rescan_cooldown_hours = _int_env(
+            "BOARDS_RESCAN_COOLDOWN_HOURS", bo.get("rescan_cooldown_hours", 1)
         )
 
         # Feature toggles
@@ -151,15 +151,16 @@ class Config:
         defaults = {
             "microsoft": 300, "nvidia": 300, "amazon": 300,
             "goldman_sachs": 200, "ibm": 200, "oracle": 200,
-            "meta": 100, "google": 200, "apple": 200,
+            "meta": 200, "google": 200, "apple": 200,
             "netflix": 200, "stripe": 200,
-            "linkedin": 100,
+            "linkedin": 100, "google_x": 200, "tiktok_usds": 100,
         }
         for name, default_max in defaults.items():
             s = src_raw.get(name, {}) or {}
+            enabled_default = False if name == "tiktok_usds" else True
             cfg.sources[name] = SourceConfig(
-                enabled=_bool(s.get("enabled", True)),
-                max_jobs=int(os.environ.get(f"MAX_{name.upper()}_JOBS", s.get("max_jobs", default_max))),
+                enabled=_bool(s.get("enabled", enabled_default)),
+                max_jobs=_int_env(f"MAX_{name.upper()}_JOBS", s.get("max_jobs", default_max)),
             )
 
         return cfg
@@ -182,3 +183,10 @@ def _bool(val) -> bool:
     if isinstance(val, bool):
         return val
     return str(val).lower() in ("1", "true", "yes")
+
+
+def _int_env(name: str, default) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        raw = default
+    return int(raw)
