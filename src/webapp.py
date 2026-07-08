@@ -2876,7 +2876,8 @@ def serve_web(
         query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
         if method == "GET":
             dataset_choice = ((query.get("dataset") or ["merged"])[-1] or "merged").strip().lower()
-            _replace_dashboard_db(dataset_choice)
+            if dataset_choice != current_dataset_preference or not Path(active_dashboard_db_path).exists():
+                _replace_dashboard_db(dataset_choice)
             _maybe_pull_repo()
 
         def _redirect_home(form: dict[str, str | list[str]] | None = None, *, message: str = ""):
