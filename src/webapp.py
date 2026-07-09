@@ -1421,7 +1421,37 @@ def serve_web(
     }
     public_db_note_logged = False
     current_dataset_preference = "merged"
+    active_dashboard_source_signature = ""
     local_db_path = _resolve_db_path(repo_root, cfg.database.path)
+
+    def _dashboard_source_signature(dataset_preference: str) -> str:
+        root = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
+        primary = _resolve_db_path(repo_root, cfg.database.path)
+        candidate_paths: list[Path] = [primary]
+        candidate_paths.extend(path for path in _state_db_paths(root) if path != primary)
+        candidate_paths.append(_github_archive_db_path(root))
+        nested_public_export = (root / "public-export").resolve()
+        candidate_paths.extend(path for path in _state_db_paths(nested_public_export) if path != primary)
+        candidate_paths.append(_github_archive_db_path(nested_public_export))
+        if root.name.lower() == "public-export":
+            parent = root.parent.resolve()
+            candidate_paths.extend(path for path in _state_db_paths(parent) if path != primary)
+            candidate_paths.append(_github_archive_db_path(parent))
+
+        requested = (dataset_preference or "merged").strip().lower()
+        parts: list[str] = [requested]
+        seen_paths: set[Path] = set()
+        for path in candidate_paths:
+            resolved = path.resolve()
+            if resolved in seen_paths or not resolved.exists():
+                continue
+            seen_paths.add(resolved)
+            try:
+                stat = resolved.stat()
+            except OSError:
+                continue
+            parts.append(f"{resolved}:{stat.st_mtime_ns}:{stat.st_size}")
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
 
     def _uses_public_db(meta: dict[str, object]) -> bool:
         source = str(meta.get("source") or "")
@@ -1478,9 +1508,10 @@ def serve_web(
             return _refresh_and_update_in_db(db, seed_job, thresholds)
 
     def _replace_dashboard_db(dataset_preference: str | None = None) -> None:
-        nonlocal db, active_dashboard_db_path, active_dashboard_db_meta, public_db_note_logged, current_dataset_preference
+        nonlocal db, active_dashboard_db_path, active_dashboard_db_meta, public_db_note_logged, current_dataset_preference, active_dashboard_source_signature
         if dataset_preference is not None:
             current_dataset_preference = (dataset_preference or "merged").strip().lower()
+        source_signature = _dashboard_source_signature(current_dataset_preference)
         replacement_path, strategy = _select_dashboard_db(repo_root, cfg.database.path, current_dataset_preference)
         resolved_path = str(replacement_path)
         snapshot = _db_snapshot(replacement_path)
@@ -1494,6 +1525,7 @@ def serve_web(
             "recent_first_seen_24h": snapshot.get("recent_first_seen_24h", 0),
             "total_jobs": snapshot.get("total_jobs", 0),
         }
+        active_dashboard_source_signature = source_signature
         if resolved_path == active_dashboard_db_path:
             _log_public_db_startup_note()
             return
@@ -2876,7 +2908,12 @@ def serve_web(
         query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
         if method == "GET":
             dataset_choice = ((query.get("dataset") or ["merged"])[-1] or "merged").strip().lower()
-            if dataset_choice != current_dataset_preference or not Path(active_dashboard_db_path).exists():
+            source_signature = _dashboard_source_signature(dataset_choice)
+            if (
+                dataset_choice != current_dataset_preference
+                or not Path(active_dashboard_db_path).exists()
+                or source_signature != active_dashboard_source_signature
+            ):
                 _replace_dashboard_db(dataset_choice)
             _maybe_pull_repo()
 
@@ -3118,12 +3155,22 @@ def serve_web(
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
         return [b"Not found."]
 
-    startup_sync_ok, startup_sync_message = _sync_github_archives()
-    if startup_sync_ok:
-        log.info(startup_sync_message)
-    else:
-        log.warning(startup_sync_message)
-    _replace_dashboard_db("merged")
+    def _run_startup_github_sync() -> None:
+        startup_sync_ok, startup_sync_message = _sync_github_archives()
+        if startup_sync_ok:
+            log.info(startup_sync_message)
+        else:
+            log.warning(startup_sync_message)
+        try:
+            _replace_dashboard_db("merged")
+        except Exception as exc:
+            log.warning("Dashboard DB refresh after startup sync failed: %s", exc)
+
+    threading.Thread(
+        target=_run_startup_github_sync,
+        name="job-radar-startup-github-sync",
+        daemon=True,
+    ).start()
 
     try:
         with make_server(host, port, app) as httpd:
