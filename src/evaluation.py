@@ -24,7 +24,7 @@ EVAL_CFG = Config.load()
 EVALUATION_PAYLOAD_VERSION = 2
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CANDIDATE_EXPERIENCE_YEARS = int(PROFILE.get("experience_years") or 3)
-TARGET_EXPERIENCE_MAX_YEARS = max(4, CANDIDATE_EXPERIENCE_YEARS + 1)
+TARGET_EXPERIENCE_MAX_YEARS = CANDIDATE_EXPERIENCE_YEARS
 TARGET_EXPERIENCE_RANGE_LABEL = f"1-{TARGET_EXPERIENCE_MAX_YEARS} year target range"
 LOCAL_CANDIDATE_EVIDENCE_PATH = ROOT_DIR / "data" / "resume" / "candidate_evidence.local.md"
 CANDIDATE_EVIDENCE_PATH = ROOT_DIR / "data" / "resume" / "candidate_evidence.md"
@@ -572,6 +572,20 @@ def _extract_years_requirement(text: str) -> int:
         flags=re.IGNORECASE,
     )
     for match in standalone_pattern.finditer(masked):
+        try:
+            mins.append(int(match.group(1)))
+        except ValueError:
+            continue
+        masked = masked[: match.start()] + (" " * (match.end() - match.start())) + masked[match.end() :]
+
+    seniority_pattern = re.compile(
+        r"\b(\d{1,2})\+?\s+years?\s+(?:of\s+)?"
+        r"(?:consistent\s+track\s+record|validated\s+ability|hands[-\s]+on\s+experience|"
+        r"professional\s+experience|work\s+experience|industry\s+experience|"
+        r"as\s+a|as\s+an|in\s+|with\s+)",
+        flags=re.IGNORECASE,
+    )
+    for match in seniority_pattern.finditer(masked):
         try:
             mins.append(int(match.group(1)))
         except ValueError:
