@@ -12,6 +12,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -169,7 +170,16 @@ def _copy_db_file(src: Path, dst: Path) -> None:
                 sidecar.unlink()
         except OSError:
             pass
-    shutil.copy2(src, dst)
+    source = sqlite3.connect(str(src), timeout=30)
+    target = sqlite3.connect(str(dst), timeout=30)
+    try:
+        source.execute("PRAGMA busy_timeout=30000")
+        target.execute("PRAGMA busy_timeout=30000")
+        source.backup(target)
+        target.commit()
+    finally:
+        target.close()
+        source.close()
 
 
 def _download_remote_db(url: str, dst: Path, *, timeout: int = 180) -> None:
@@ -567,18 +577,51 @@ def _safe_merge_dashboard_db(
     merged_name = f"dashboard-merged-{merge_hash}.db"
     merged_path = (Path(repo_root) / "state" / merged_name).resolve() if repo_root else Path(base_snap["path"])
     try:
-        _copy_db_file(Path(base_snap["path"]), merged_path)
-        prefer_base_on_conflict = strategy_label == "merged-public+local"
-        for overlay_snap in overlays:
-            _merge_jobs_into(
-                merged_path,
-                Path(overlay_snap["path"]),
-                prefer_base_on_conflict=prefer_base_on_conflict,
-            )
-            _merge_boards_into(merged_path, Path(overlay_snap["path"]))
-            _merge_source_runs_into(merged_path, Path(overlay_snap["path"]))
+        with tempfile.TemporaryDirectory(prefix="job-radar-dashboard-merge-") as temp_dir:
+            temp_root = Path(temp_dir)
+            snapshot_paths: list[Path] = []
+            for index, snap in enumerate(ordered):
+                snapshot_path = temp_root / f"input-{index}.db"
+                _copy_db_file(Path(snap["path"]), snapshot_path)
+                snapshot_paths.append(snapshot_path)
+
+            _copy_db_file(snapshot_paths[0], merged_path)
+            prefer_base_on_conflict = strategy_label == "merged-public+local"
+            for overlay_path in snapshot_paths[1:]:
+                _merge_jobs_into(
+                    merged_path,
+                    overlay_path,
+                    prefer_base_on_conflict=prefer_base_on_conflict,
+                )
+                _merge_boards_into(merged_path, overlay_path)
+                _merge_source_runs_into(merged_path, overlay_path)
         return merged_path, strategy_label
     except (sqlite3.Error, OSError) as exc:
+        try:
+            _copy_db_file(Path(base_snap["path"]), merged_path)
+            prefer_base_on_conflict = strategy_label == "merged-public+local"
+            for overlay_snap in overlays:
+                overlay_path = Path(overlay_snap["path"])
+                if not overlay_path.exists():
+                    continue
+                overlay_snapshot = merged_path.with_name(f"{merged_path.stem}-overlay-{hashlib.sha1(str(overlay_path).encode('utf-8')).hexdigest()[:8]}.db")
+                try:
+                    _copy_db_file(overlay_path, overlay_snapshot)
+                    _merge_jobs_into(
+                        merged_path,
+                        overlay_snapshot,
+                        prefer_base_on_conflict=prefer_base_on_conflict,
+                    )
+                    _merge_boards_into(merged_path, overlay_snapshot)
+                    _merge_source_runs_into(merged_path, overlay_snapshot)
+                finally:
+                    try:
+                        overlay_snapshot.unlink()
+                    except OSError:
+                        pass
+            return merged_path, strategy_label
+        except (sqlite3.Error, OSError):
+            pass
         base_path = Path(base_snap["path"])
         log.warning(
             "Dashboard DB merge failed for %s: %s. Falling back to %s.",
