@@ -932,6 +932,22 @@ class Database:
             ).fetchone()
         return row is not None
 
+    MAX_EMPTY_BOARD_COOLDOWN_HOURS = 720  # 30 days
+
+    @classmethod
+    def empty_board_cooldown_hours(
+        cls,
+        fail_count: int,
+        *,
+        empty_fail_threshold: int = 3,
+        base_cooldown_hours: int = 168,
+    ) -> int:
+        """Back off boards that repeatedly return zero jobs without retiring them."""
+        extra = max(0, int(fail_count) - max(empty_fail_threshold, 1))
+        capped_extra = min(extra, 16)
+        hours = max(base_cooldown_hours, 1) * (2 ** capped_extra)
+        return min(hours, cls.MAX_EMPTY_BOARD_COOLDOWN_HOURS)
+
     def should_skip_board(
         self,
         board_id: str,
@@ -953,17 +969,20 @@ class Database:
             last_checked = datetime.fromisoformat(str(row["last_checked"] or ""))
         except ValueError:
             return False
-        within_cooldown = (datetime.now(timezone.utc) - last_checked).total_seconds() < max(cooldown_hours, 1) * 3600
-        if not within_cooldown:
-            return False
         if status == "degraded":
             if fail_count < max(empty_fail_threshold, 1):
                 return False
             if str(row["fail_reason"] or "").strip() != "0 jobs returned":
                 return False
-            return True
+            effective_cooldown = self.empty_board_cooldown_hours(
+                fail_count,
+                empty_fail_threshold=empty_fail_threshold,
+                base_cooldown_hours=cooldown_hours,
+            )
+            return (datetime.now(timezone.utc) - last_checked).total_seconds() < effective_cooldown * 3600
         if status == "broken":
-            return fail_count >= max(broken_fail_threshold, 1)
+            within_cooldown = (datetime.now(timezone.utc) - last_checked).total_seconds() < max(cooldown_hours, 1) * 3600
+            return within_cooldown and fail_count >= max(broken_fail_threshold, 1)
         return False
 
     def was_board_checked_recently(self, board_id: str, *, cooldown_hours: int = 6) -> bool:
