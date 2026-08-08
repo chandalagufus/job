@@ -1,5 +1,5 @@
 board_id,platform,company,url,fail_count,fail_reason,last_checked
-ashby:aviator,ashby,Aviator,https://jobs.ashbyhq.com/aviator,1,HTTP 404,2026-08-08T05:31:09.318431+00:00
+ashby:aviator,ashby,Aviator,https://jobs.ashbyhq.com/aviator,1,HTTP 404,2026-08-08T07:19:30.469055+00:00
 ashby:contextual,ashby,Contextual AI,https://jobs.ashbyhq.com/contextual,1,HTTP 404,2026-06-19T05:45:44.905457+00:00
 ashby:continue,ashby,Continue,https://jobs.ashbyhq.com/continue,1,HTTP 404,2026-07-24T04:02:42.643745+00:00
 ashby:laminar,ashby,Laminar,https://jobs.ashbyhq.com/laminar,0,HTTP 404,2026-05-11T21:38:51.828172+00:00
@@ -10,7 +10,7 @@ ashby:statsig,ashby,Statsig,https://jobs.ashbyhq.com/statsig,1,HTTP 404,2026-07-
 ashby:tinybird,ashby,Tinybird,https://jobs.ashbyhq.com/tinybird,0,HTTP 404,2026-05-11T22:04:41.314066+00:00
 ashby:travelperk,ashby,Travelperk,https://jobs.ashbyhq.com/travelperk,0,HTTP 404,2026-05-11T22:04:41.382346+00:00
 greenhouse:ada,greenhouse,Ada,https://job-boards.greenhouse.io/ada,0,HTTP 404,2026-05-11T22:04:33.469614+00:00
-greenhouse:aerospike,greenhouse,Aerospike,https://boards.greenhouse.io/aerospike,1,HTTP 404,2026-08-08T05:16:14.922854+00:00
+greenhouse:aerospike,greenhouse,Aerospike,https://boards.greenhouse.io/aerospike,1,HTTP 404,2026-08-08T07:14:26.757887+00:00
 greenhouse:alan,greenhouse,Alan,https://boards.greenhouse.io/alan,0,HTTP 404,2026-05-11T21:46:51.794895+00:00
 greenhouse:alchemy,greenhouse,Alchemy,https://boards.greenhouse.io/alchemy,0,HTTP 404,2026-05-11T21:38:52.063869+00:00
 greenhouse:alltrails,greenhouse,AllTrails,https://boards.greenhouse.io/alltrails,0,HTTP 404,2026-05-11T21:46:52.048315+00:00
@@ -52,7 +52,7 @@ greenhouse:snowflake,greenhouse,Snowflake,https://boards.greenhouse.io/snowflake
 greenhouse:styra,greenhouse,Styra,https://boards.greenhouse.io/styra,0,HTTP 404,2026-05-11T21:50:54.771251+00:00
 greenhouse:swishanalytics,greenhouse,Swish Analytics,https://boards.greenhouse.io/swishanalytics,0,HTTP 404,2026-05-11T21:39:21.049660+00:00
 greenhouse:teads,greenhouse,Teads,https://boards.greenhouse.io/teads,0,HTTP 404,2026-05-11T21:50:54.898952+00:00
-greenhouse:tekion,greenhouse,Tekion,https://boards.greenhouse.io/tekion,1,HTTP 404,2026-08-08T05:21:22.142233+00:00
+greenhouse:tekion,greenhouse,Tekion,https://boards.greenhouse.io/tekion,1,HTTP 404,2026-08-08T07:16:51.125856+00:00
 greenhouse:temporal,greenhouse,Temporal,https://boards.greenhouse.io/temporal,7,HTTP 404,2026-06-19T05:21:24.580016+00:00
 greenhouse:thumbtack,greenhouse,Thumbtack,https://boards.greenhouse.io/thumbtack,0,HTTP 404,2026-05-11T21:39:21.196801+00:00
 greenhouse:transcarent,greenhouse,Transcarent,https://boards.greenhouse.io/transcarent,1,HTTP 404,2026-07-09T04:21:54.304363+00:00
