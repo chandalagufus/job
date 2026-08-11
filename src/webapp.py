@@ -1711,7 +1711,7 @@ def serve_web(
                 f"Started next board batch at {started_at}. "
                 f"It will scan up to {batch_size} boards from the current cursor ({worker_db_cursor})."
             )
-        elif mode == "broad_boards":
+        elif mode in {"broad_boards", "broad_all"}:
             cursor_db = _open_worker_db()
             worker_db_cursor = cursor_db.get_cursor(BROAD_NON_WORKDAY_CURSOR_KEY)
             try:
@@ -1720,11 +1720,18 @@ def serve_web(
                 worker_db_cursor = 0
             finally:
                 cursor_db.close()
-            message = (
-                f"Started broad non-Workday board batch at {started_at}. "
-                f"It will scan up to {BROAD_NON_WORKDAY_BATCH_SIZE} Greenhouse/Lever/iCIMS boards "
-                f"from the broad cursor ({worker_db_cursor})."
-            )
+            if mode == "broad_all":
+                message = (
+                    f"Started full broad non-Workday sweep at {started_at}. "
+                    f"It resumes from the broad cursor ({worker_db_cursor}) and wraps until all broad boards are covered."
+                )
+                _set_persistent_scan_value("last_broad_sweep_started_at", started_at)
+            else:
+                message = (
+                    f"Started broad non-Workday board batch at {started_at}. "
+                    f"It will scan up to {BROAD_NON_WORKDAY_BATCH_SIZE} Greenhouse/Lever/iCIMS boards "
+                    f"from the broad cursor ({worker_db_cursor})."
+                )
         elif mode == "all":
             cursor_db = _open_worker_db()
             worker_db_cursor = cursor_db.get_cursor("boards_main")
@@ -1775,7 +1782,7 @@ def serve_web(
                         run_until_wrap=(mode == "all"),
                         show_live_progress=False,
                     )
-                if mode == "broad_boards":
+                if mode in {"broad_boards", "broad_all"}:
                     boards_csv = _resolve_boards_csv(BROAD_NON_WORKDAY_BOARDS_CSV)
                     run_boards(
                         cfg,
@@ -1790,6 +1797,7 @@ def serve_web(
                         test_notify=False,
                         notify_yes_only=True,
                         cursor_key=BROAD_NON_WORKDAY_CURSOR_KEY,
+                        run_until_wrap=(mode == "broad_all"),
                         show_live_progress=False,
                     )
                 finished_at = datetime.now(timezone.utc).isoformat()
@@ -1800,10 +1808,14 @@ def serve_web(
                     if mode == "main"
                     else "Completed broad non-Workday board batch scan."
                     if mode == "broad_boards"
+                    else "Completed full broad non-Workday sweep from the saved broad cursor."
+                    if mode == "broad_all"
                     else "Completed next board batch scan."
                 )
                 if mode == "all":
                     _set_persistent_scan_value("last_full_sweep_finished_at", finished_at)
+                if mode == "broad_all":
+                    _set_persistent_scan_value("last_broad_sweep_finished_at", finished_at)
             except Exception as exc:
                 finished_at = datetime.now(timezone.utc).isoformat()
                 log.exception("Web-triggered scan failed: %s", exc)
@@ -2215,6 +2227,8 @@ def serve_web(
         scan_state_label = "Running" if scan.get("running") else "Idle"
         last_full_sweep_finished = escape(_get_persistent_scan_value("last_full_sweep_finished_at"))
         last_full_sweep_started = escape(_get_persistent_scan_value("last_full_sweep_started_at"))
+        last_broad_sweep_finished = escape(_get_persistent_scan_value("last_broad_sweep_finished_at"))
+        last_broad_sweep_started = escape(_get_persistent_scan_value("last_broad_sweep_started_at"))
         boards_cursor_updated_at = escape(_get_persistent_scan_value("boards_main_updated_at"))
         broad_boards_cursor_updated_at = escape(_get_persistent_scan_value(f"{BROAD_NON_WORKDAY_CURSOR_KEY}_updated_at"))
         board_total = _board_inventory_total(cfg)
@@ -2317,6 +2331,13 @@ def serve_web(
             + f"<p class=\"muted\">Resume point: <strong>{boards_cursor}</strong> / {board_total or 'unknown'}</p>"
             + f"<p class=\"muted\">Broad non-Workday resume point: <strong>{broad_boards_cursor}</strong> / {broad_board_total or 'unknown'}</p>"
             + (
+                f"<p class=\"muted\">Last broad non-Workday sweep: <strong>{last_broad_sweep_finished}</strong></p>"
+                if last_broad_sweep_finished
+                else f"<p class=\"muted\">Last broad non-Workday sweep started: <strong>{last_broad_sweep_started}</strong> (no completion recorded yet)</p>"
+                if last_broad_sweep_started
+                else ""
+            )
+            + (
                 f"<p class=\"muted\">Last saved cursor update: <strong>{boards_cursor_updated_at}</strong></p>"
                 if boards_cursor_updated_at
                 else ""
@@ -2364,6 +2385,12 @@ def serve_web(
             "<h3>Scan Broad Non-Workday Batch</h3>"
             f"<p>Extra Greenhouse/Lever/iCIMS coverage from the broad lane. Scans up to {BROAD_NON_WORKDAY_BATCH_SIZE} boards and advances a separate broad cursor.</p>"
             "<div class=\"actions\"><button type=\"submit\" name=\"scan_mode\" value=\"broad_boards\">Run Broad Batch</button></div>"
+            "</div>"
+            "<div class=\"scan-card danger-card\">"
+            "<h3>Scan All Broad Non-Workday</h3>"
+            f"<p>Walks the full broad non-Workday lane from the saved broad cursor until all {broad_board_total or 'known'} boards are covered.</p>"
+            "<label class=\"confirm-line\"><input type=\"checkbox\" name=\"confirm_broad_sweep\" value=\"1\">I really want a full broad sweep</label>"
+            "<div class=\"actions\"><button type=\"submit\" name=\"scan_mode\" value=\"broad_all\" class=\"danger-button\">Run Full Broad Sweep</button></div>"
             "</div>"
             "<div class=\"scan-card danger-card\">"
             "<h3>Scan Full Board Sweep</h3>"
@@ -3021,12 +3048,17 @@ def serve_web(
         if path == "/scan" and method == "POST":
             form = _read_post(environ)
             mode = (form.get("scan_mode", "all") or "all").strip().lower()
-            if mode not in {"main", "boards", "broad_boards", "all"}:
+            if mode not in {"main", "boards", "broad_boards", "broad_all", "all"}:
                 mode = "all"
             if mode == "all" and form.get("confirm_full_sweep") != "1":
                 return _redirect_home(
                     form,
                     message="Full board sweep not started. Check the confirmation box if you really want a full local sweep.",
+                )
+            if mode == "broad_all" and form.get("confirm_broad_sweep") != "1":
+                return _redirect_home(
+                    form,
+                    message="Full broad non-Workday sweep not started. Check the confirmation box if you really want to scan the full broad lane.",
                 )
             started = _start_scan(mode)
             if not started:
