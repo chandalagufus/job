@@ -191,10 +191,38 @@ class EvaluationEvidenceTests(unittest.TestCase):
                 location="Cambridge, MA",
                 source="linkedin",
                 require_us_location=False,
-            )
+        )
 
         self.assertNotEqual(result.score, 0)
-        self.assertTrue(any("citizenship requirement detected" in reason.lower() for reason in result.reasons))
+        risk_dimension = next(d for d in result.dimensions if d.name == "risk")
+        self.assertIn("citizenship requirement detected", risk_dimension.reason.lower())
+
+    def test_unrestricted_authorization_without_future_sponsorship_blocks_role(self) -> None:
+        jd = (
+            "Partner with data engineering and AI teams to define agile stories for RAG and LLM workflows.\n"
+            "Candidates must possess unrestricted authorization to work in the U.S. for any employer, "
+            "without the need for sponsorship now or in the future.\n"
+            "Required: Python, SQL, agile delivery, prompt engineering, and AI evaluation criteria.\n"
+        )
+        evidence = (
+            "Built Python and SQL data workflows, RAG systems, prompt engineering workflows, "
+            "and AI evaluation harnesses with agile stakeholder delivery."
+        )
+
+        with patch("src.evaluation._resume_evidence_text", return_value=evidence):
+            result = evaluate_job(
+                "IT Business Analyst - Intelligence & AI",
+                jd,
+                company="Northmarq",
+                location="Bloomington, MN",
+                source="linkedin",
+                require_us_location=False,
+            )
+
+        self.assertEqual(result.score, 0)
+        self.assertEqual(result.label, "no")
+        self.assertEqual(result.grade, "F")
+        self.assertTrue(any("does not offer visa sponsorship" in reason.lower() for reason in result.reasons))
 
 
 if __name__ == "__main__":

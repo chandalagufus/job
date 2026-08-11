@@ -163,6 +163,10 @@ VISA_SPONSORSHIP_BLOCK_REGEXES: tuple[str, ...] = (
     r"\bvisa\s+sponsorship\s+(?:is\s+)?unavailable\b",
     r"\bnot\s+eligible\s+for\s+visa\s+sponsorship\b",
     r"\bmust\s+have\s+current\s+authorization\s+to\s+work\b",
+    r"\bunrestricted\s+(?:work\s+)?authorization\s+to\s+work\s+in\s+the\s+u\.?s\.?\b",
+    r"\bauthori[sz]ation\s+to\s+work\s+in\s+the\s+u\.?s\.?.{0,160}\bwithout\s+(?:the\s+)?need\s+for\s+(?:employer\s+)?sponsorship\b",
+    r"\bwithout\s+(?:the\s+)?need\s+for\s+(?:employer\s+)?sponsorship\s+(?:now\s+or\s+in\s+the\s+future|now\s+or\s+future|currently\s+or\s+in\s+the\s+future)\b",
+    r"\bwithout\s+(?:requiring|requiring\s+any|needing)\s+(?:employer\s+)?sponsorship\s+(?:now\s+or\s+in\s+the\s+future|now\s+or\s+future|currently\s+or\s+in\s+the\s+future)\b",
 )
 
 
