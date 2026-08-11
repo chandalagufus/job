@@ -224,6 +224,31 @@ class EvaluationEvidenceTests(unittest.TestCase):
         self.assertEqual(result.grade, "F")
         self.assertTrue(any("does not offer visa sponsorship" in reason.lower() for reason in result.reasons))
 
+    def test_audio_asr_model_compression_role_is_capped_without_domain_evidence(self) -> None:
+        jd = (
+            "Required Qualifications\n"
+            "- Python, PyTorch, and Hugging Face experience.\n"
+            "- Practical ASR and speech-to-text model development across multiple languages.\n"
+            "- Audio preprocessing with torchaudio or librosa and WER/CER evaluation.\n"
+            "- LoRA or QLoRA adaptation plus quantization, distillation, or pruning for on-device iPhone inference.\n"
+        )
+        evidence = (
+            "Built Python and PyTorch model evaluation workflows, RAG systems, and FastAPI model-serving utilities."
+        )
+
+        with patch("src.evaluation._resume_evidence_text", return_value=evidence):
+            result = evaluate_job(
+                "Audio AI Engineer / Multilingual Speech-to-Text Engineer",
+                jd,
+                company="Dev Technology",
+                location="Reston, VA",
+                source="linkedin",
+                require_us_location=False,
+            )
+
+        self.assertLessEqual(result.score, 58)
+        self.assertTrue(any("specialized speech/audio" in reason.lower() for reason in result.reasons))
+
 
 if __name__ == "__main__":
     unittest.main()

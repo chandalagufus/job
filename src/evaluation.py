@@ -67,6 +67,62 @@ OPTIONAL_PORTFOLIO_CONTEXT_HINTS = (
     "github)",
     "github )",
 )
+SPECIALIZED_UNSUPPORTED_REQUIREMENT_ALIASES: dict[str, tuple[str, ...]] = {
+    "asr/speech-to-text": (
+        "asr",
+        "automatic speech recognition",
+        "speech to text",
+        "speech-to-text",
+        "stt",
+    ),
+    "multilingual speech": (
+        "multilingual asr",
+        "multilingual speech",
+        "code switching",
+        "code-switching",
+        "accent",
+        "accents",
+    ),
+    "audio preprocessing": (
+        "audio preprocessing",
+        "audio pipeline",
+        "audio pipelines",
+        "torchaudio",
+        "librosa",
+        "whisper",
+        "wav2vec",
+        "ctc",
+    ),
+    "speech evaluation": (
+        "wer",
+        "word error rate",
+        "cer",
+        "character error rate",
+    ),
+    "parameter-efficient tuning": (
+        "lora",
+        "qlora",
+        "peft",
+        "parameter efficient fine tuning",
+        "parameter-efficient fine-tuning",
+    ),
+    "model compression": (
+        "quantization",
+        "distillation",
+        "model distillation",
+        "pruning",
+        "model compression",
+    ),
+    "on-device optimization": (
+        "on device",
+        "on-device",
+        "iphone",
+        "ios",
+        "mobile inference",
+        "memory optimization",
+        "battery optimization",
+    ),
+}
 SKILL_EVIDENCE_ALIASES: dict[str, tuple[str, ...]] = {
     "apache spark": ("apache spark", "spark", "pyspark"),
     "ci/cd": ("ci/cd", "ci cd", "github actions"),
@@ -788,6 +844,54 @@ def _onsite_mismatch_cap(location: str, text: str) -> tuple[int, str]:
     return 58, f"Capped because this looks like an onsite role outside your preferred markets: {location or 'unknown location'}."
 
 
+def _unsupported_specialized_requirement_gaps(title: str, description: str) -> list[str]:
+    sections = _jd_sections(description)
+    title_text = _norm(title)
+    required_scope = _norm(
+        sections.get("required", ""),
+        sections.get("responsibilities", ""),
+    )
+    full_scope = _norm(sections.get("full_text", description))
+    central_audio_role = any(
+        token in title_text
+        for token in (
+            "audio",
+            "speech",
+            "asr",
+            "speech to text",
+            "speech-to-text",
+        )
+    )
+    scan_scope = required_scope or (full_scope if central_audio_role else "")
+    if not scan_scope:
+        return []
+
+    evidence_text = _resume_evidence_text()
+    gaps: list[str] = []
+    for label, aliases in SPECIALIZED_UNSUPPORTED_REQUIREMENT_ALIASES.items():
+        if not any(_phrase_match(scan_scope, alias) for alias in aliases):
+            continue
+        if any(_phrase_match(evidence_text, alias) for alias in aliases):
+            continue
+        gaps.append(label)
+    return gaps
+
+
+def _specialized_domain_score_cap(title: str, description: str) -> tuple[int, str]:
+    gaps = _unsupported_specialized_requirement_gaps(title, description)
+    if len(gaps) >= 4:
+        return 58, (
+            "Capped because this role centers on specialized speech/audio or model-compression requirements "
+            f"not backed by resume/project evidence: {', '.join(gaps[:5])}."
+        )
+    if len(gaps) >= 2:
+        return 64, (
+            "Capped because important specialized speech/audio or model-compression requirements are not backed "
+            f"by resume/project evidence: {', '.join(gaps[:4])}."
+        )
+    return 100, ""
+
+
 def _dimension_evidence(
     description: str,
     matched_strong: list[str],
@@ -994,10 +1098,12 @@ def evaluate_job(
     score = round(sum(d.weighted_points for d in dimensions) - experience_penalty)
     evidence_cap, evidence_cap_reason = _evidence_score_cap(description, source)
     resume_cap, resume_cap_reason = _resume_gap_score_cap(assessment)
+    specialized_cap, specialized_cap_reason = _specialized_domain_score_cap(title, description)
     onsite_cap, onsite_cap_reason = _onsite_mismatch_cap(location, text)
     remote_review_reason = _remote_scope_review_reason(location, text)
     score = min(score, evidence_cap)
     score = min(score, resume_cap)
+    score = min(score, specialized_cap)
     score = min(score, onsite_cap)
     if remote_review_reason:
         score = min(score, 69)
@@ -1013,6 +1119,8 @@ def evaluate_job(
         reasons.insert(0, evidence_cap_reason)
     if resume_cap_reason and resume_cap_reason not in reasons:
         reasons.insert(0, resume_cap_reason)
+    if specialized_cap_reason and specialized_cap_reason not in reasons:
+        reasons.insert(0, specialized_cap_reason)
     if onsite_cap_reason and onsite_cap_reason not in reasons:
         reasons.insert(0, onsite_cap_reason)
     if remote_review_reason and remote_review_reason not in reasons:

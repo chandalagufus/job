@@ -160,7 +160,6 @@ SKILLS_STRONG: set[str] = {
     "linux",
     "llmops",
     "llm evaluation",
-    "llm fine-tuning",
     "lru cache",
     "lstm",
     "layer normalization",
