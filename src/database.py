@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     pipeline_notes TEXT NOT NULL DEFAULT '',
     follow_up_date TEXT NOT NULL DEFAULT '',
     pipeline_updated_at TEXT NOT NULL DEFAULT '',
+    viewed_at    TEXT NOT NULL DEFAULT '',
     first_seen   TEXT NOT NULL,
     last_seen    TEXT NOT NULL
 );
@@ -347,8 +348,11 @@ class Database:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN follow_up_date TEXT NOT NULL DEFAULT ''")
         if "pipeline_updated_at" not in job_columns:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN pipeline_updated_at TEXT NOT NULL DEFAULT ''")
+        if "viewed_at" not in job_columns:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN viewed_at TEXT NOT NULL DEFAULT ''")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_grade ON jobs(grade)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_pipeline_status ON jobs(pipeline_status)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_viewed_at ON jobs(viewed_at)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_canonical_key ON jobs(canonical_key)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_is_repost ON jobs(is_repost)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_source_runs_mode ON source_runs(mode)")
@@ -416,9 +420,9 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO jobs(
-                    key,source,provenance,company,title,location,url,posted,score,label,grade,evaluation_json,description,manual_input,fit_summary,canonical_key,structured_json,is_repost,repost_of_key,employer_quality_score,employer_quality_reason,pipeline_status,pipeline_notes,follow_up_date,pipeline_updated_at,first_seen,last_seen
+                    key,source,provenance,company,title,location,url,posted,score,label,grade,evaluation_json,description,manual_input,fit_summary,canonical_key,structured_json,is_repost,repost_of_key,employer_quality_score,employer_quality_reason,pipeline_status,pipeline_notes,follow_up_date,pipeline_updated_at,viewed_at,first_seen,last_seen
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(key) DO UPDATE SET
                     provenance=CASE
                         WHEN excluded.provenance = '' THEN jobs.provenance
@@ -491,13 +495,17 @@ class Database:
                         WHEN jobs.pipeline_updated_at = '' THEN excluded.pipeline_updated_at
                         ELSE jobs.pipeline_updated_at
                     END,
+                    viewed_at=CASE
+                        WHEN jobs.viewed_at = '' THEN excluded.viewed_at
+                        ELSE jobs.viewed_at
+                    END,
                     last_seen=excluded.last_seen
                 """,
                 (
                     key, source, provenance, company, title, location, url, effective_posted, score, label,
                     grade, evaluation_json, description, 1 if manual_input else 0, fit_summary,
                     canonical, structured, 1 if repost_flag else 0, repost_key, quality_score, quality_reason,
-                    pipeline_status, pipeline_notes, follow_up_date, now, now, now,
+                    pipeline_status, pipeline_notes, follow_up_date, now, "", now, now,
                 ),
             )
 
@@ -616,7 +624,7 @@ class Database:
                    provenance,
                    evaluation_json, description, manual_input, fit_summary, canonical_key,
                    structured_json, is_repost, repost_of_key, employer_quality_score, employer_quality_reason, pipeline_status,
-                   pipeline_notes, follow_up_date, pipeline_updated_at, first_seen, last_seen
+                   pipeline_notes, follow_up_date, pipeline_updated_at, viewed_at, first_seen, last_seen
             FROM jobs
             ORDER BY score DESC, employer_quality_score DESC, last_seen DESC
             LIMIT ?
@@ -631,7 +639,7 @@ class Database:
                    provenance,
                    evaluation_json, description, manual_input, fit_summary, canonical_key,
                    structured_json, is_repost, repost_of_key, employer_quality_score, employer_quality_reason, pipeline_status,
-                   pipeline_notes, follow_up_date, pipeline_updated_at, first_seen, last_seen
+                   pipeline_notes, follow_up_date, pipeline_updated_at, viewed_at, first_seen, last_seen
             FROM jobs
             ORDER BY
                 CASE
@@ -656,13 +664,27 @@ class Database:
                    provenance,
                    evaluation_json, description, manual_input, fit_summary, canonical_key,
                    structured_json, is_repost, repost_of_key, employer_quality_score, employer_quality_reason, pipeline_status,
-                   pipeline_notes, follow_up_date, pipeline_updated_at, first_seen, last_seen
+                   pipeline_notes, follow_up_date, pipeline_updated_at, viewed_at, first_seen, last_seen
             FROM jobs
             WHERE key=?
             """,
             (key,),
         ).fetchone()
         return _normalize_job_row(dict(row)) if row is not None else None
+
+    def mark_job_viewed(self, key: str) -> None:
+        with self._tx() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET viewed_at=CASE
+                        WHEN viewed_at IS NULL OR viewed_at = '' THEN ?
+                        ELSE viewed_at
+                    END
+                WHERE key=?
+                """,
+                (_now(), key),
+            )
 
     def update_job_evaluation(
         self,

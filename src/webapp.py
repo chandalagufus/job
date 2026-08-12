@@ -328,7 +328,7 @@ def _merge_job_rows(existing_row: sqlite3.Row, incoming_row: sqlite3.Row, column
     merged = {column: existing_row[column] for column in columns}
     incoming = {column: incoming_row[column] for column in columns}
 
-    for field in ("title", "location", "url", "canonical_key", "repost_of_key", "employer_quality_reason"):
+    for field in ("title", "location", "url", "canonical_key", "repost_of_key", "employer_quality_reason", "viewed_at"):
         merged[field] = _prefer_non_empty(merged.get(field), incoming.get(field))
     if "provenance" in merged:
         merged["provenance"] = _merge_provenance_text(merged.get("provenance"), incoming.get("provenance"))
@@ -385,7 +385,7 @@ def _merge_archive_job_rows(
     merged = {column: existing_row[column] for column in columns}
     incoming = {column: incoming_row[column] for column in columns}
 
-    for field in ("title", "location", "url", "canonical_key", "repost_of_key", "employer_quality_reason"):
+    for field in ("title", "location", "url", "canonical_key", "repost_of_key", "employer_quality_reason", "viewed_at"):
         merged[field] = _prefer_non_empty(merged.get(field), incoming.get(field))
     if "provenance" in merged:
         merged["provenance"] = _merge_provenance_text(merged.get("provenance"), incoming.get("provenance"))
@@ -825,6 +825,39 @@ def _job_sort_dt(job: dict) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
+def _job_fetch_dt(job: dict) -> datetime:
+    first_seen_dt = _parse_datetime(job.get("first_seen", ""))
+    if first_seen_dt is not None:
+        return first_seen_dt
+    return _job_sort_dt(job)
+
+
+def _job_fetch_hour_dt(job: dict) -> datetime:
+    dt = _job_fetch_dt(job)
+    if dt.year <= 1970:
+        return dt
+    local_dt = dt.astimezone(LOCAL_TIMEZONE)
+    return local_dt.replace(minute=0, second=0, microsecond=0)
+
+
+def _job_viewed_sort_value(job: dict) -> int:
+    return 1 if str(job.get("viewed_at") or "").strip() else 0
+
+
+def _format_local_dt(raw_value: object) -> str:
+    dt = _parse_datetime(str(raw_value or ""))
+    if dt is None:
+        return ""
+    return dt.astimezone(LOCAL_TIMEZONE).strftime("%b %d, %I:%M %p").replace(" 0", " ")
+
+
+def _fetched_bucket_label(job: dict) -> str:
+    dt = _job_fetch_hour_dt(job)
+    if dt.year <= 1970:
+        return "Fetched time unknown"
+    return f"Fetched {dt.strftime('%b %d, %I %p').replace(' 0', ' ')}"
+
+
 def _job_sort_ts(job: dict) -> float:
     dt = _job_sort_dt(job)
     if dt.year <= 1970:
@@ -907,6 +940,9 @@ def _sort_jobs(jobs: list[dict], sort_by: str) -> None:
     if sort_by == "oldest":
         jobs.sort(key=lambda job: (_job_sort_dt(job), job["score"]))
         return
+    if sort_by == "posted":
+        jobs.sort(key=lambda job: (_job_sort_dt(job), int(job.get("score") or 0)), reverse=True)
+        return
     if sort_by == "score":
         jobs.sort(key=lambda job: (int(job.get("score") or 0), _job_sort_dt(job)), reverse=True)
         return
@@ -929,7 +965,16 @@ def _sort_jobs(jobs: list[dict], sort_by: str) -> None:
             )
         )
         return
-    jobs.sort(key=lambda job: (_job_sort_dt(job), job["score"]), reverse=True)
+    jobs.sort(
+        key=lambda job: (
+            _job_fetch_hour_dt(job),
+            -_job_viewed_sort_value(job),
+            _job_fetch_dt(job),
+            int(job.get("score") or 0),
+            _job_sort_dt(job),
+        ),
+        reverse=True,
+    )
 
 
 def _queue_match(job: dict, queue: str, status: str) -> bool:
@@ -1311,6 +1356,11 @@ def _layout(title: str, body: str) -> bytes:
     .no {{ color: var(--bad); }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }}
+    .section-row td {{
+      background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+      border-top: 2px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }}
     textarea, input[type=text], input[type=url], select {{
       width: 100%; box-sizing: border-box; border: 1px solid var(--line);
       border-radius: 10px; padding: 10px 12px; font: inherit; background: var(--field); color: var(--field-ink);
@@ -1967,6 +2017,25 @@ def serve_web(
             refreshed = target_db.get_job(seed_job["key"]) or refreshed
         return refreshed, evaluation
 
+    def _mark_job_viewed(key: str) -> None:
+        if not key:
+            return
+        if not _uses_public_db(active_dashboard_db_meta):
+            try:
+                _dashboard_db_call("mark_job_viewed", key)
+            except Exception as exc:
+                log.debug("Failed to mark active dashboard job viewed: %s", exc)
+        for path, writer in _open_backing_dbs():
+            try:
+                writer.mark_job_viewed(key)
+            except Exception as exc:
+                log.debug("Failed to mark job viewed in backing DB %s: %s", path, exc)
+            finally:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
     def _persist_evaluation(job: dict) -> tuple[dict, object]:
         stored_evaluation = _evaluation_from_payload(job)
         if stored_evaluation is not None:
@@ -2137,10 +2206,27 @@ def serve_web(
         )
         source_names = sorted({(job.get("source") or "").strip().lower() for job in jobs if (job.get("source") or "").strip()})
         rows: list[str] = []
+        current_fetch_bucket = ""
+        show_fetch_buckets = sort_by in {"newest", "fetched"}
         for job in jobs:
+            fetch_bucket = _fetched_bucket_label(job)
+            if show_fetch_buckets and fetch_bucket != current_fetch_bucket:
+                current_fetch_bucket = fetch_bucket
+                rows.append(
+                    "<tr class=\"section-row\">"
+                    f"<td colspan=\"11\"><strong>{escape(fetch_bucket)}</strong> "
+                    "<span class=\"muted\">unviewed jobs are listed first inside this fetched group</span></td>"
+                    "</tr>"
+                )
             label = escape(job["label"])
             grade = escape(job.get("grade") or "F")
             pipeline_status = escape(job.get("pipeline_status") or "new")
+            fetched_text = _format_local_dt(job.get("first_seen")) or "unknown"
+            viewed_text = _format_local_dt(job.get("viewed_at"))
+            fetched_html = (
+                f"<div>{escape(fetched_text)}</div>"
+                + (f"<div class=\"muted\">Viewed {escape(viewed_text)}</div>" if viewed_text else "<div class=\"pill\">Unviewed</div>")
+            )
             dataset_href = quote(dataset_choice, safe="")
             role_bits = [
                 f"<a href=\"/job?key={quote(job['key'], safe='')}&dataset={dataset_href}\">{escape(job['title'])}</a>",
@@ -2157,13 +2243,14 @@ def serve_web(
                 f"<td><span class=\"score {label}\">{job['score']}</span></td>"
                 f"<td>{grade}</td>"
                 f"<td class=\"{label}\">{label.upper()}</td>"
+                f"<td>{fetched_html}</td>"
                 f"<td>{quality_score}</td>"
                 f"<td>{_structured_signal_pills(job)}</td>"
                 f"<td>{pipeline_status}</td>"
                 f"<td>{escape(job['source'])}</td>"
                 "</tr>"
             )
-        rows_html = "".join(rows) if rows else "<tr><td colspan=\"10\">No jobs match the current filters.</td></tr>"
+        rows_html = "".join(rows) if rows else "<tr><td colspan=\"11\">No jobs match the current filters.</td></tr>"
         queue_options = "".join(
             f"<option value=\"{name}\"{' selected' if queue == name else ''}>{label}</option>"
             for name, label in (("active", "Active"), ("actionable", "Actionable"), ("all", "All"))
@@ -2205,6 +2292,7 @@ def serve_web(
             f"<option value=\"{name}\"{' selected' if sort_by == name else ''}>{label}</option>"
             for name, label in (
                 ("newest", "Newest"),
+                ("posted", "Posted Newest"),
                 ("oldest", "Oldest"),
                 ("score", "Score"),
                 ("rating", "Rating"),
@@ -2460,7 +2548,7 @@ def serve_web(
             "<button type=\"submit\">Update Selected Jobs</button>"
             "</div>"
             "<div class=\"table-wrap\">"
-            "<table><thead><tr><th>Select</th><th>Role</th><th>Location</th><th>Score</th><th>Grade</th><th>Label</th><th>Employer</th><th>Signals</th><th>Status</th><th>Source</th></tr></thead>"
+            "<table><thead><tr><th>Select</th><th>Role</th><th>Location</th><th>Score</th><th>Grade</th><th>Label</th><th>Fetched</th><th>Employer</th><th>Signals</th><th>Status</th><th>Source</th></tr></thead>"
             f"<tbody>{rows_html}</tbody></table>"
             "</div>"
             "</form>"
@@ -2481,6 +2569,10 @@ def serve_web(
             start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
             return [b"Job not found."]
 
+        _mark_job_viewed(key)
+        if not str(job.get("viewed_at") or "").strip():
+            job = dict(job)
+            job["viewed_at"] = datetime.now(timezone.utc).isoformat()
         job, evaluation = _persist_evaluation(job)
 
         flags = _flags()
