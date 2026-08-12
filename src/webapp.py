@@ -1608,6 +1608,27 @@ def serve_web(
         replacement_path, strategy = _select_dashboard_db(repo_root, cfg.database.path, current_dataset_preference)
         resolved_path = str(replacement_path)
         snapshot = _db_snapshot(replacement_path)
+        current_total_jobs = int(active_dashboard_db_meta.get("total_jobs") or 0)
+        replacement_total_jobs = int(snapshot.get("total_jobs") or 0)
+        same_dataset_refresh = str(active_dashboard_db_meta.get("dataset") or "") == current_dataset_preference
+        if (
+            same_dataset_refresh
+            and resolved_path != active_dashboard_db_path
+            and Path(active_dashboard_db_path).exists()
+            and current_total_jobs >= 1000
+            and replacement_total_jobs > 0
+            and replacement_total_jobs < int(current_total_jobs * 0.8)
+        ):
+            log.warning(
+                "Dashboard DB replacement skipped: candidate %s (%s, %s jobs) is much smaller than active %s (%s jobs).",
+                resolved_path,
+                strategy,
+                replacement_total_jobs,
+                active_dashboard_db_path,
+                current_total_jobs,
+            )
+            return
+
         active_dashboard_db_meta = {
             "path": resolved_path,
             "strategy": strategy,
@@ -2172,7 +2193,7 @@ def serve_web(
     def _jobs_page(start_response, query: dict[str, list[str]]):
         days_raw = (query.get("days") or [str(RECENT_JOB_DAYS)])[-1]
         queue = ((query.get("queue") or ["active"])[-1] or "active").strip().lower()
-        dataset_choice = ((query.get("dataset") or ["merged"])[-1] or "merged").strip().lower()
+        dataset_choice = ((query.get("dataset") or [current_dataset_preference])[-1] or current_dataset_preference).strip().lower()
         status = ((query.get("status") or ["all"])[-1] or "all").strip().lower()
         source = ((query.get("source") or ["all"])[-1] or "all").strip().lower()
         sort_by = ((query.get("sort") or ["newest"])[-1] or "newest").strip().lower()
@@ -3069,7 +3090,7 @@ def serve_web(
         method = environ.get("REQUEST_METHOD", "GET").upper()
         query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
         if method == "GET":
-            dataset_choice = ((query.get("dataset") or ["merged"])[-1] or "merged").strip().lower()
+            dataset_choice = ((query.get("dataset") or [current_dataset_preference])[-1] or current_dataset_preference).strip().lower()
             source_signature = _dashboard_source_signature(dataset_choice)
             if (
                 dataset_choice != current_dataset_preference
