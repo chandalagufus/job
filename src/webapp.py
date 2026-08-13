@@ -2078,8 +2078,11 @@ def serve_web(
                     refreshed_job, refreshed_eval = active_result
                     chosen_job = refreshed_job
                     chosen_eval = refreshed_eval
-            for _, writer in writers:
-                _refresh_and_update_in_db(writer, job, thresholds)
+            for path, writer in writers:
+                try:
+                    _refresh_and_update_in_db(writer, job, thresholds)
+                except Exception as exc:
+                    log.warning("Skipped evaluation persist to backing DB %s: %s", path, exc)
             return chosen_job, chosen_eval
         finally:
             for path, writer in writers:
