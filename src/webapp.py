@@ -23,9 +23,10 @@ from wsgiref.simple_server import make_server
 
 from .config import Config
 from .database import Database
-from .evaluation import EVALUATION_PAYLOAD_VERSION, EvaluationDimension, EvaluationResult, evaluate_job
+from .evaluation import EVAL_CFG, EVALUATION_PAYLOAD_VERSION, EvaluationDimension, EvaluationResult, evaluate_job
 from .job_intelligence import extract_workday_req_id
-from .scoring_policy import calibrate_thresholds
+from .llm_scorer import apply_llm_delta, review_jobs_batch
+from .scoring_policy import calibrate_thresholds, label_for_score
 from .resume_builder import generate_resume_packet
 from .sources.base import is_us_location, remote_scope_status
 
@@ -415,7 +416,10 @@ def _merge_archive_job_rows(
 
     should_overlay_scores = False
     if prefer_overlay_scores and (incoming_eval or incoming_label or incoming_score > 0):
+        existing_score = int(merged.get("score") or 0)
         if not existing_eval:
+            should_overlay_scores = True
+        elif incoming_score > 0 and existing_score == 0:
             should_overlay_scores = True
         elif len(incoming_desc) > len(existing_desc):
             should_overlay_scores = True
@@ -1036,6 +1040,7 @@ def _feature_defaults(cfg: Config) -> dict[str, bool]:
         "notifications": cfg.features.notifications,
         "manual_jd": cfg.features.manual_jd,
         "resume_generation": cfg.features.resume_generation,
+        "llm_scoring": cfg.llm_scoring.enabled,
     }
 
 
@@ -1173,6 +1178,43 @@ def _display_job_with_fresh_evaluation(job: dict, thresholds, evaluator) -> dict
     updated["grade"] = fresh.grade
     updated["fit_summary"] = fresh.fit_summary
     updated["evaluation_json"] = fresh.to_json()
+    return updated
+
+
+def _display_job_with_consistent_evaluation(job: dict, thresholds) -> dict:
+    """Cheap list-page cleanup; full rescoring stays on detail/batch paths."""
+    updated = dict(job)
+    raw = str(updated.get("evaluation_json") or "").strip()
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict) and int(payload.get("version") or 0) == EVALUATION_PAYLOAD_VERSION:
+            try:
+                score = int(payload.get("score") or updated.get("score") or 0)
+            except Exception:
+                score = int(updated.get("score") or 0)
+            updated["score"] = score
+            updated["label"] = str(
+                payload.get("label")
+                or label_for_score(score, yes_threshold=thresholds.yes, maybe_threshold=thresholds.maybe)
+            ).strip().lower()
+            updated["grade"] = _score_to_grade(score)
+            fit_summary = str(payload.get("fit_summary") or "").strip()
+            if fit_summary:
+                updated["fit_summary"] = fit_summary
+            return updated
+
+    try:
+        score = int(updated.get("score") or 0)
+    except Exception:
+        score = 0
+    updated["score"] = score
+    updated["grade"] = _score_to_grade(score)
+    label = str(updated.get("label") or "").strip().lower()
+    if label not in {"yes", "maybe", "no"}:
+        updated["label"] = label_for_score(score, yes_threshold=thresholds.yes, maybe_threshold=thresholds.maybe)
     return updated
 
 
@@ -1830,6 +1872,7 @@ def serve_web(
         def _worker() -> None:
             from .main import _resolve_boards_csv, build_notifier, run_boards, run_main
 
+            _sync_runtime_feature_flags()
             worker_db = _open_worker_db()
             notifier = build_notifier(cfg)
             finished_at = ""
@@ -1955,6 +1998,38 @@ def serve_web(
     def _flags() -> dict[str, bool]:
         return _dashboard_db_call("get_feature_flags", defaults)
 
+    def _sync_runtime_feature_flags(flags: dict[str, bool] | None = None) -> dict[str, bool]:
+        current = flags or _flags()
+        # The switchboard can disable LLM scoring at runtime. Config/env still
+        # owns enabling and API credentials so a stray checkbox cannot create calls.
+        EVAL_CFG.llm_scoring.provider = cfg.llm_scoring.provider
+        EVAL_CFG.llm_scoring.model = cfg.llm_scoring.model
+        EVAL_CFG.llm_scoring.api_key = cfg.llm_scoring.api_key
+        EVAL_CFG.llm_scoring.endpoint = cfg.llm_scoring.endpoint
+        EVAL_CFG.llm_scoring.timeout = cfg.llm_scoring.timeout
+        EVAL_CFG.llm_scoring.only_score_min = cfg.llm_scoring.only_score_min
+        EVAL_CFG.llm_scoring.only_score_max = cfg.llm_scoring.only_score_max
+        EVAL_CFG.llm_scoring.max_score_adjustment = cfg.llm_scoring.max_score_adjustment
+        EVAL_CFG.llm_scoring.max_description_chars = cfg.llm_scoring.max_description_chars
+        EVAL_CFG.llm_scoring.batch_size = cfg.llm_scoring.batch_size
+        EVAL_CFG.llm_scoring.max_calls_per_process = cfg.llm_scoring.max_calls_per_process
+        EVAL_CFG.llm_scoring.max_daily_calls = cfg.llm_scoring.max_daily_calls
+        EVAL_CFG.llm_scoring.enabled = bool(cfg.llm_scoring.enabled and current.get("llm_scoring", cfg.llm_scoring.enabled))
+        return current
+
+    def _set_feature_flag_everywhere(name: str, enabled: bool) -> None:
+        _dashboard_db_call("set_feature_flag", name, enabled)
+        for path, writer in _open_backing_dbs():
+            try:
+                writer.set_feature_flag(name, enabled)
+            except Exception as exc:
+                log.debug("Failed to save feature flag %s to backing DB %s: %s", name, path, exc)
+            finally:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
     def _label_thresholds():
         return calibrate_thresholds(_dashboard_db_call("get_feedback_jobs"))
 
@@ -1991,7 +2066,8 @@ def serve_web(
                 log.warning("Skipping backing DB %s for dashboard write: %s", path, exc)
         return opened
 
-    def _evaluate_for_row(job_row: dict, thresholds) -> object:
+    def _evaluate_for_row(job_row: dict, thresholds, *, use_llm: bool = True) -> object:
+        _sync_runtime_feature_flags()
         return evaluate_job(
             job_row["title"],
             job_row.get("description", ""),
@@ -2001,7 +2077,34 @@ def serve_web(
             require_us_location=cfg.filter.require_us_location,
             yes_threshold=thresholds.yes,
             maybe_threshold=thresholds.maybe,
+            use_llm=use_llm,
         )
+
+    def _apply_llm_review_to_evaluation(evaluation: EvaluationResult, review, thresholds) -> EvaluationResult:
+        if not review or not getattr(review, "used", False):
+            return evaluation
+        adjusted_score = apply_llm_delta(
+            score=evaluation.score,
+            critical_skill_gaps=evaluation.critical_skill_gaps,
+            review=review,
+            max_adjustment=EVAL_CFG.llm_scoring.max_score_adjustment,
+        )
+        evaluation.llm_review = review.to_dict()
+        if adjusted_score != evaluation.score:
+            evaluation.score = adjusted_score
+            evaluation.grade = _score_to_grade(evaluation.score)
+            evaluation.label = label_for_score(
+                evaluation.score,
+                yes_threshold=thresholds.yes,
+                maybe_threshold=thresholds.maybe,
+            )
+            if review.reason:
+                evaluation.reasons.insert(0, f"LLM reviewer adjusted score by {review.score_delta}: {review.reason}")
+        elif review.reason:
+            evaluation.reasons.append(f"LLM reviewer kept score unchanged: {review.reason}")
+        evaluation.reasons = evaluation.reasons[:4]
+        evaluation.fit_summary = f"Grade {evaluation.grade} ({evaluation.score}/100). " + " ".join(evaluation.reasons[:3])
+        return evaluation
 
     def _refresh_and_update_in_db(target_db: Database, seed_job: dict, thresholds) -> tuple[dict, object] | None:
         existing = target_db.get_job(seed_job["key"])
@@ -2106,6 +2209,11 @@ def serve_web(
             min_score = 0
 
         board_jobs = _dashboard_db_call("list_jobs_for_board", limit=None)
+        thresholds = _label_thresholds()
+        board_jobs = [
+            _display_job_with_consistent_evaluation(job, thresholds)
+            for job in board_jobs
+        ]
         filtered_jobs = [
             job for job in board_jobs
             if _dataset_match(job, dataset)
@@ -2144,7 +2252,80 @@ def serve_web(
         thresholds = _label_thresholds()
         writers = [] if active_only else _open_backing_dbs()
         writer_paths = {path for path, _ in writers}
-        eligible_jobs = [job for job in jobs if job is not None and _batch_rescore_allowed(job)]
+        # Web batch re-score writes to the disposable active dashboard DB, so
+        # it should refresh imported rows too. Otherwise the list can show a
+        # stale YES while the detail page recalculates the same job as MAYBE.
+        eligible_jobs = [
+            job for job in jobs
+            if job is not None and (active_only or _batch_rescore_allowed(job))
+        ]
+        if active_only:
+            _sync_runtime_feature_flags()
+            refreshed_jobs: list[dict] = []
+            with db_lock:
+                for job in eligible_jobs:
+                    existing = db.get_job(job["key"])
+                    if existing is None:
+                        continue
+                    db.refresh_job_intelligence(
+                        key=job["key"],
+                        source=job["source"],
+                        company=job["company"],
+                        title=job["title"],
+                        location=job["location"],
+                        url=job["url"],
+                        description=job.get("description", ""),
+                    )
+                    refreshed_jobs.append(db.get_job(job["key"]) or job)
+
+            evaluated_jobs: list[tuple[dict, EvaluationResult]] = [
+                (job, _evaluate_for_row(job, thresholds, use_llm=False))
+                for job in refreshed_jobs
+            ]
+            reviews = {}
+            if EVAL_CFG.llm_scoring.enabled:
+                batch_size = max(1, min(20, int(getattr(EVAL_CFG.llm_scoring, "batch_size", 10) or 10)))
+                chunk_count = 0
+                for idx in range(0, len(evaluated_jobs), batch_size):
+                    chunk = evaluated_jobs[idx: idx + batch_size]
+                    chunk_count += 1
+                    reviews.update(
+                        review_jobs_batch(
+                            cfg=EVAL_CFG,
+                            jobs=[
+                                {
+                                    "key": job["key"],
+                                    "title": job.get("title", ""),
+                                    "company": job.get("company", ""),
+                                    "location": job.get("location", ""),
+                                    "description": job.get("description", ""),
+                                    "deterministic_payload": evaluation.to_dict(),
+                                }
+                                for job, evaluation in chunk
+                            ],
+                        )
+                    )
+                log.info(
+                    "LLM batch re-score: candidates=%s, batch_size=%s, chunks=%s, reviews=%s",
+                    len(evaluated_jobs),
+                    batch_size,
+                    chunk_count,
+                    len(reviews),
+                )
+
+            with db_lock:
+                for job, evaluation in evaluated_jobs:
+                    evaluation = _apply_llm_review_to_evaluation(evaluation, reviews.get(job["key"]), thresholds)
+                    db.update_job_evaluation(
+                        key=job["key"],
+                        score=evaluation.score,
+                        label=evaluation.label,
+                        grade=evaluation.grade,
+                        evaluation_json=evaluation.to_json(),
+                        fit_summary=evaluation.fit_summary,
+                        description=job.get("description", ""),
+                    )
+            return len(evaluated_jobs)
         try:
             for job in eligible_jobs:
                 wrote_active = False
@@ -2552,7 +2733,7 @@ def serve_web(
             f"<label>Re-score Batch<br><select name=\"rescore_limit\">{rescore_options}</select></label>"
             "<button type=\"submit\">Batch Re-score Jobs</button>"
             "</form>"
-            "<p class=\"muted\">Batch re-score only updates <strong>local</strong> and <strong>github-mine</strong> provenance jobs by default.</p>"
+            "<p class=\"muted\">Batch re-score updates the active dashboard copy for every job in the current filtered view. Durable backing DB writes remain protected for imported sources.</p>"
             "</div>"
             "</div>"
             "<div class=\"card\">"
@@ -2799,13 +2980,34 @@ def serve_web(
         return [_layout("Paste JD", body)]
 
     def _settings_page(start_response):
-        flags = _flags()
+        flags = _sync_runtime_feature_flags()
+        llm_configured = bool(cfg.llm_scoring.enabled and cfg.llm_scoring.api_key)
+        llm_runtime_active = bool(EVAL_CFG.llm_scoring.enabled)
+        llm_status = (
+            "<div class=\"card\">"
+            "<h2>LLM Scoring Status</h2>"
+            f"<p class=\"muted\">Provider: <strong>{escape(cfg.llm_scoring.provider)}</strong> | "
+            f"Model: <strong>{escape(cfg.llm_scoring.model)}</strong></p>"
+            f"<p class=\"muted\">Config enabled: <strong>{'yes' if cfg.llm_scoring.enabled else 'no'}</strong> | "
+            f"API key loaded: <strong>{'yes' if bool(cfg.llm_scoring.api_key) else 'no'}</strong> | "
+            f"Feature flag checked: <strong>{'yes' if flags.get('llm_scoring', False) else 'no'}</strong></p>"
+            f"<p class=\"muted\">Runtime active: <strong>{'yes' if llm_runtime_active else 'no'}</strong>. "
+            "Runtime active must be yes before Gemini reviews can be written.</p>"
+            "</div>"
+        )
         items = []
         for name, enabled in flags.items():
             checked = " checked" if enabled else ""
             label = name.replace("_", " ").title()
+            detail = ""
+            if name == "llm_scoring":
+                detail = (
+                    " <span class=\"muted\">(requires API key/config; unchecked means no LLM calls)</span>"
+                    if llm_configured
+                    else " <span class=\"muted\">(not active until app starts with LLM_SCORING_ENABLED=true and GEMINI_API_KEY)</span>"
+                )
             items.append(
-                f"<label><input type=\"checkbox\" name=\"{escape(name)}\" value=\"1\"{checked}> {escape(label)}</label>"
+                f"<label><input type=\"checkbox\" name=\"{escape(name)}\" value=\"1\"{checked}> {escape(label)}{detail}</label>"
             )
         body = (
             "<div class=\"card\">"
@@ -2818,6 +3020,7 @@ def serve_web(
             "<div class=\"actions\"><button type=\"submit\">Save Feature Settings</button></div>"
             "</form>"
             "</div>"
+            f"{llm_status}"
         )
         start_response("200 OK", _html_headers())
         return [_layout("Feature Switchboard", body)]
@@ -3316,7 +3519,8 @@ def serve_web(
         if path == "/settings" and method == "POST":
             form = _read_post(environ)
             for name in defaults:
-                _dashboard_db_call("set_feature_flag", name, form.get(name) == "1")
+                _set_feature_flag_everywhere(name, form.get(name) == "1")
+            _sync_runtime_feature_flags()
             return _redirect(start_response, "/settings")
 
         if path == "/resume" and method == "GET":

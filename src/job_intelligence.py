@@ -6,6 +6,8 @@ import json
 import re
 from urllib.parse import urlsplit, urlunsplit
 
+from .profile import PROFILE
+
 
 _AGENCY_PATTERNS = (
     r"staffing",
@@ -76,8 +78,27 @@ _CLEARANCE_RE = re.compile(
     r"\b(secret|top secret|ts/sci|ts sci|security clearance|public trust)\b",
     re.IGNORECASE,
 )
+_YEARS_RE = re.compile(
+    r"(?P<min>\d{1,2})\+?\s*(?:-|to|–|—)?\s*(?P<max>\d{1,2})?\s+years?\s+(?:of\s+)?"
+    r"(?:total\s+)?(?:relevant\s+)?(?:professional\s+|work\s+|industry\s+)?(?:experience|exp)\b",
+    re.IGNORECASE,
+)
+_YEARS_RE = re.compile(
+    r"(?P<min>\d{1,2})\+?\s*(?:-|to)?\s*(?P<max>\d{1,2})?\s+years?\s+(?:of\s+)?"
+    r"(?:total\s+)?(?:relevant\s+)?(?:professional\s+|work\s+|industry\s+)?"
+    r"(?:[a-z0-9+/#,\-\s]{0,80}\s+)?(?:experience|exp)\b",
+    re.IGNORECASE,
+)
 _CITIZENSHIP_REQ_RE = re.compile(
     r"\b(must\s+be\s+(?:a\s+)?u\.?s\.?\s+citizen|u\.?s\.?\s+citizen(?:ship)?\s+(?:is\s+)?required|citizenship\s+(?:is\s+)?required)\b",
+    re.IGNORECASE,
+)
+_YEARS_REQUIREMENT_CONTEXT_RE = re.compile(
+    r"\b(required|requirements?|qualifications?|minimum|preferred|candidate|role|work|professional|industry|relevant)\b",
+    re.IGNORECASE,
+)
+_EMPLOYER_HISTORY_CONTEXT_RE = re.compile(
+    r"\b(company|firm|organization|business|provider|founded|serving|premier)\b",
     re.IGNORECASE,
 )
 _WORKDAY_REQ_RE = re.compile(r"(R-\d+)(?:-\d+)?", re.IGNORECASE)
@@ -267,6 +288,49 @@ def _salary_range_is_reasonable(
     return True
 
 
+def _accepted_years_match(match: re.Match[str], text: str) -> bool:
+    try:
+        years = int(match.group("min"))
+    except (IndexError, ValueError):
+        return False
+    if years > 20:
+        return False
+    start = max(0, match.start() - 180)
+    context = text[start : min(len(text), match.end() + 120)]
+    if years >= 15 and _EMPLOYER_HISTORY_CONTEXT_RE.search(context) and not _YEARS_REQUIREMENT_CONTEXT_RE.search(context):
+        return False
+    return True
+
+
+def _candidate_degree_keyword() -> str:
+    education = str(PROFILE.get("education") or "").lower()
+    if any(token in education for token in ("ph.d", "phd", "doctor")):
+        return "phd"
+    if any(token in education for token in ("m.s", "ms ", "master", "masters", "graduate")):
+        return "master"
+    if any(token in education for token in ("b.s", "bs ", "bachelor", "undergraduate")):
+        return "bachelor"
+    return ""
+
+
+def _select_years_match_for_candidate(matches: list[re.Match[str]], text: str) -> re.Match[str] | None:
+    if not matches:
+        return None
+    degree = _candidate_degree_keyword()
+    degree_patterns = {
+        "phd": r"\b(ph\.?d|doctorate|doctoral)\b",
+        "master": r"\b(master|masters|master['’`]?s|masterâ€™s|m\.?s\.?)",
+        "bachelor": r"\b(bachelor|bachelors|bachelor['’`]?s|bachelorâ€™s|b\.?s\.?)",
+    }
+    pattern = degree_patterns.get(degree)
+    if pattern:
+        for match in matches:
+            context = text[max(0, match.start() - 120) : match.start()]
+            if re.search(pattern, context, flags=re.IGNORECASE):
+                return match
+    return max(matches, key=lambda match: int(match.group("min")))
+
+
 def extract_structured_fields(title: str, description: str, *, location: str = "") -> dict:
     text = "\n".join(part for part in (title, location, description) if part).strip()
     text_lower = text.lower()
@@ -312,7 +376,8 @@ def extract_structured_fields(title: str, description: str, *, location: str = "
             data["salary_currency"] = "USD" if currency == "$" else currency
             data["salary_period"] = _salary_period_name(salary_match.group("period") or "")
 
-    years_match = _YEARS_RE.search(text)
+    years_matches = [match for match in _YEARS_RE.finditer(text) if _accepted_years_match(match, text)]
+    years_match = _select_years_match_for_candidate(years_matches, text)
     if years_match:
         data["years_experience_min"] = int(years_match.group("min"))
         if years_match.group("max"):
@@ -320,7 +385,12 @@ def extract_structured_fields(title: str, description: str, *, location: str = "
 
     if re.search(r"\b(sponsor|sponsorship available|visa support)\b", text_lower):
         data["visa_sponsorship"] = True
-    elif re.search(r"\b(no visa sponsorship|unable to sponsor|will not sponsor|cannot sponsor)\b", text_lower):
+    elif re.search(
+        r"\b(no visa sponsorship|unable to sponsor|will not sponsor|cannot sponsor|"
+        r"visa sponsorship(?: is)? not available|u\.?s\.? work visa sponsorship.{0,120}not available|"
+        r"permanent work authorization in the united states)\b",
+        text_lower,
+    ):
         data["visa_sponsorship"] = False
 
     if _CLEARANCE_RE.search(text):

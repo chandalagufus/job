@@ -70,6 +70,23 @@ class FeaturesConfig:
 
 
 @dataclass
+class LLMScoringConfig:
+    enabled: bool = False
+    provider: str = "google"
+    model: str = "gemini-3.5-flash-lite"
+    api_key: str = ""
+    endpoint: str = "https://generativelanguage.googleapis.com/v1beta"
+    timeout: int = 20
+    only_score_min: int = 55
+    only_score_max: int = 80
+    max_score_adjustment: int = 8
+    max_description_chars: int = 6000
+    batch_size: int = 10
+    max_calls_per_process: int = 100
+    max_daily_calls: int = 300
+
+
+@dataclass
 class Config:
     email: EmailConfig = field(default_factory=EmailConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
@@ -78,6 +95,7 @@ class Config:
     filter: FilterConfig = field(default_factory=FilterConfig)
     boards: BoardsConfig = field(default_factory=BoardsConfig)
     features: FeaturesConfig = field(default_factory=FeaturesConfig)
+    llm_scoring: LLMScoringConfig = field(default_factory=LLMScoringConfig)
     http_timeout: int = 30
     sources: dict[str, SourceConfig] = field(default_factory=dict)
 
@@ -145,6 +163,52 @@ class Config:
         cfg.features.notifications = _bool(os.environ.get("FEATURE_NOTIFICATIONS", ft.get("notifications", True)))
         cfg.features.manual_jd = _bool(os.environ.get("FEATURE_MANUAL_JD", ft.get("manual_jd", True)))
         cfg.features.resume_generation = _bool(os.environ.get("FEATURE_RESUME_GENERATION", ft.get("resume_generation", True)))
+
+        # Optional LLM reviewer for second-pass scoring. Disabled by default so
+        # scans remain deterministic unless API credentials are explicitly set.
+        llm = raw.get("llm_scoring", {}) or {}
+        cfg.llm_scoring.enabled = _bool(os.environ.get("LLM_SCORING_ENABLED", llm.get("enabled", False)))
+        cfg.llm_scoring.provider = os.environ.get("LLM_SCORING_PROVIDER", llm.get("provider", "google"))
+        provider = str(cfg.llm_scoring.provider or "google").strip().lower()
+        default_llm_models = {
+            "google": "gemini-3.5-flash-lite",
+            "groq": "openai/gpt-oss-20b",
+            "openrouter": "openrouter/free",
+        }
+        cfg.llm_scoring.model = os.environ.get(
+            "LLM_SCORING_MODEL",
+            llm.get("model") or default_llm_models.get(provider, "gemini-3.5-flash-lite"),
+        )
+        provider_key_env = {
+            "google": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+            "groq": ("GROQ_API_KEY",),
+            "openrouter": ("OPENROUTER_API_KEY",),
+        }
+        api_key = os.environ.get("LLM_SCORING_API_KEY", "")
+        if not api_key:
+            for env_name in provider_key_env.get(provider, ()):
+                api_key = os.environ.get(env_name, "")
+                if api_key:
+                    break
+        cfg.llm_scoring.api_key = api_key or llm.get("api_key", "")
+        cfg.llm_scoring.endpoint = os.environ.get(
+            "LLM_SCORING_ENDPOINT",
+            llm.get("endpoint", "https://generativelanguage.googleapis.com/v1beta"),
+        )
+        cfg.llm_scoring.timeout = _int_env("LLM_SCORING_TIMEOUT", llm.get("timeout", 20))
+        cfg.llm_scoring.only_score_min = _int_env("LLM_SCORING_ONLY_SCORE_MIN", llm.get("only_score_min", 55))
+        cfg.llm_scoring.only_score_max = _int_env("LLM_SCORING_ONLY_SCORE_MAX", llm.get("only_score_max", 80))
+        cfg.llm_scoring.max_score_adjustment = _int_env(
+            "LLM_SCORING_MAX_SCORE_ADJUSTMENT", llm.get("max_score_adjustment", 8)
+        )
+        cfg.llm_scoring.max_description_chars = _int_env(
+            "LLM_SCORING_MAX_DESCRIPTION_CHARS", llm.get("max_description_chars", 6000)
+        )
+        cfg.llm_scoring.batch_size = _int_env("LLM_SCORING_BATCH_SIZE", llm.get("batch_size", 10))
+        cfg.llm_scoring.max_calls_per_process = _int_env(
+            "LLM_SCORING_MAX_CALLS_PER_PROCESS", llm.get("max_calls_per_process", 100)
+        )
+        cfg.llm_scoring.max_daily_calls = _int_env("LLM_SCORING_MAX_DAILY_CALLS", llm.get("max_daily_calls", 300))
 
         # Per-source config
         src_raw = raw.get("sources", {}) or {}

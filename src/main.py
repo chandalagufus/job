@@ -1173,6 +1173,7 @@ def _dispatch_results(
             yes_threshold=thresholds.yes,
             maybe_threshold=thresholds.maybe,
         )
+        setattr(j, "_evaluation_result", evaluation)
         j.score = evaluation.score
         j.label = evaluation.label
         intelligence = db.inspect_job(
@@ -1306,16 +1307,18 @@ def _dispatch_results(
     # Persist all seen jobs to DB
     if not dry_run:
         for j in matched:
-            evaluation = evaluate_job(
-                j.title,
-                j.description,
-                company=j.company,
-                location=j.location,
-                source=j.source,
-                require_us_location=cfg.filter.require_us_location,
-                yes_threshold=thresholds.yes,
-                maybe_threshold=thresholds.maybe,
-            )
+            evaluation = getattr(j, "_evaluation_result", None)
+            if evaluation is None:
+                evaluation = evaluate_job(
+                    j.title,
+                    j.description,
+                    company=j.company,
+                    location=j.location,
+                    source=j.source,
+                    require_us_location=cfg.filter.require_us_location,
+                    yes_threshold=thresholds.yes,
+                    maybe_threshold=thresholds.maybe,
+                )
             evaluation_payload = evaluation.to_dict()
             evaluation_payload["score"] = int(j.score)
             evaluation_payload["label"] = str(j.label)

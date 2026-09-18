@@ -46,6 +46,24 @@ features:
   manual_jd: true
   resume_generation: true
 
+# Optional LLM second-pass scoring reviewer.
+# Disabled by default. For Gemini, set GEMINI_API_KEY or GOOGLE_API_KEY in
+# your shell/.env instead of storing the key in this file.
+# Other supported providers: groq, openrouter.
+llm_scoring:
+  enabled: false
+  provider: google
+  model: gemini-2.5-flash-lite
+  endpoint: https://generativelanguage.googleapis.com/v1beta
+  timeout: 20
+  only_score_min: 55
+  only_score_max: 80
+  max_score_adjustment: 8
+  max_description_chars: 6000
+  batch_size: 10
+  max_calls_per_process: 100
+  max_daily_calls: 300
+
 # Per-source caps (set enabled: false to skip a source)
 sources:
   microsoft:

@@ -16,6 +16,7 @@ from .classifier import (
     classify,
 )
 from .config import Config
+from .llm_scorer import apply_llm_delta, maybe_review_job
 from .profile import PROFILE, SKILLS_MODERATE, SKILLS_STRONG
 from .scoring_policy import DEFAULT_MAYBE_THRESHOLD, DEFAULT_YES_THRESHOLD, label_for_score
 from .sources.base import is_us_location, remote_scope_status
@@ -215,9 +216,12 @@ VISA_SPONSORSHIP_BLOCK_REGEXES: tuple[str, ...] = (
     r"\bwill\s+not\s+sponsor\b",
     r"\bdoes\s+not\s+offer\s+visa\s+sponsorship\b",
     r"\bno\s+(?:employment|work)\s+visa\s+sponsorship\b",
+    r"\bu\.?s\.?\s+work\s+visa\s+sponsorship\b.{0,120}\bnot\s+available\b",
     r"\bvisa\s+sponsorship\s+(?:is\s+)?not\s+available\b",
     r"\bvisa\s+sponsorship\s+(?:is\s+)?unavailable\b",
     r"\bnot\s+eligible\s+for\s+visa\s+sponsorship\b",
+    r"\brequires?\s+permanent\s+work\s+authorization\s+in\s+the\s+united\s+states\b",
+    r"\bpermanent\s+work\s+authorization\s+in\s+the\s+united\s+states\s+(?:is\s+)?required\b",
     r"\bmust\s+have\s+current\s+authorization\s+to\s+work\b",
     r"\bunrestricted\s+(?:work\s+)?authorization\s+to\s+work\s+in\s+the\s+u\.?s\.?\b",
     r"\bauthori[sz]ation\s+to\s+work\s+in\s+the\s+u\.?s\.?.{0,160}\bwithout\s+(?:the\s+)?need\s+for\s+(?:employer\s+)?sponsorship\b",
@@ -251,9 +255,10 @@ class EvaluationResult:
     reasons: list[str]
     fit_summary: str
     dimensions: list[EvaluationDimension]
+    llm_review: dict | None = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "version": EVALUATION_PAYLOAD_VERSION,
             "score": self.score,
             "label": self.label,
@@ -267,6 +272,9 @@ class EvaluationResult:
             "fit_summary": self.fit_summary,
             "dimensions": [asdict(d) | {"weighted_points": round(d.weighted_points, 2)} for d in self.dimensions],
         }
+        if self.llm_review:
+            payload["llm_review"] = self.llm_review
+        return payload
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=True, sort_keys=True)
@@ -613,14 +621,31 @@ def _extract_years_requirement(text: str) -> int:
         return 0
     mins: list[int] = []
 
+    def accept(match: re.Match) -> bool:
+        try:
+            years = int(match.group(1))
+        except ValueError:
+            return False
+        if years > 20:
+            return False
+        window_start = max(0, match.start() - 180)
+        context = normalized[window_start : min(len(normalized), match.end() + 120)].lower()
+        if years >= 15 and re.search(r"\b(company|firm|organization|business|provider|founded|serving|premier)\b", context):
+            if not re.search(r"\b(required|requirements?|qualifications?|minimum|preferred|candidate|role|work|professional|industry|relevant)\b", context):
+                return False
+        return True
+
     # Treat ranges by their minimum accepted experience, e.g. "4-7+ years" is a
     # 4-year minimum, not a 7-year hard requirement.
     range_pattern = re.compile(
-        r"\b(\d{1,2})\s*(?:-|to)\s*(\d{1,2})\+?\s+years?\s+(?:of\s+)?(?:experience|exp)\b",
+        r"\b(\d{1,2})\s*(?:-|to)\s*(\d{1,2})\+?\s+years?\s+(?:of\s+)?"
+        r"(?:total\s+)?(?:relevant\s+)?(?:professional\s+|work\s+|industry\s+)?(?:experience|exp)\b",
         flags=re.IGNORECASE,
     )
     masked = normalized
     for match in range_pattern.finditer(normalized):
+        if not accept(match):
+            continue
         try:
             mins.append(int(match.group(1)))
         except ValueError:
@@ -628,10 +653,28 @@ def _extract_years_requirement(text: str) -> int:
         masked = masked[: match.start()] + (" " * (match.end() - match.start())) + masked[match.end() :]
 
     standalone_pattern = re.compile(
-        r"\b(\d{1,2})\+?\s+years?\s+(?:of\s+)?(?:experience|exp)\b",
+        r"\b(\d{1,2})\+?\s+years?\s+(?:of\s+)?"
+        r"(?:total\s+)?(?:relevant\s+)?(?:professional\s+|work\s+|industry\s+)?(?:experience|exp)\b",
         flags=re.IGNORECASE,
     )
     for match in standalone_pattern.finditer(masked):
+        if not accept(match):
+            continue
+        try:
+            mins.append(int(match.group(1)))
+        except ValueError:
+            continue
+        masked = masked[: match.start()] + (" " * (match.end() - match.start())) + masked[match.end() :]
+
+    broad_experience_pattern = re.compile(
+        r"\b(\d{1,2})\+?\s+years?\s+(?:of\s+)?"
+        r"(?:total\s+)?(?:relevant\s+)?(?:professional\s+|work\s+|industry\s+)?"
+        r"(?:[a-z0-9+/#,\-\s]{0,80}\s+)?(?:experience|exp)\b",
+        flags=re.IGNORECASE,
+    )
+    for match in broad_experience_pattern.finditer(masked):
+        if not accept(match):
+            continue
         try:
             mins.append(int(match.group(1)))
         except ValueError:
@@ -646,6 +689,8 @@ def _extract_years_requirement(text: str) -> int:
         flags=re.IGNORECASE,
     )
     for match in seniority_pattern.finditer(masked):
+        if not accept(match):
+            continue
         try:
             mins.append(int(match.group(1)))
         except ValueError:
@@ -972,6 +1017,7 @@ def evaluate_job(
     require_us_location: bool | None = None,
     yes_threshold: int = DEFAULT_YES_THRESHOLD,
     maybe_threshold: int = DEFAULT_MAYBE_THRESHOLD,
+    use_llm: bool = True,
 ) -> EvaluationResult:
     if require_us_location is None:
         require_us_location = EVAL_CFG.filter.require_us_location
@@ -1128,7 +1174,7 @@ def evaluate_job(
     reasons = reasons[:4]
     fit_summary = f"Grade {grade} ({score}/100). " + " ".join(reasons[:3])
 
-    return EvaluationResult(
+    result = EvaluationResult(
         score=score,
         label=label,
         grade=grade,
@@ -1141,3 +1187,36 @@ def evaluate_job(
         fit_summary=fit_summary,
         dimensions=dimensions,
     )
+    llm_review = maybe_review_job(
+        cfg=EVAL_CFG,
+        title=title,
+        company=company,
+        location=location,
+        description=description,
+        deterministic_payload=result.to_dict(),
+    ) if use_llm else None
+    if llm_review is None:
+        return result
+    if llm_review.used:
+        adjusted_score = apply_llm_delta(
+            score=result.score,
+            critical_skill_gaps=result.critical_skill_gaps,
+            review=llm_review,
+            max_adjustment=EVAL_CFG.llm_scoring.max_score_adjustment,
+        )
+        result.llm_review = llm_review.to_dict()
+        if adjusted_score != result.score:
+            result.score = adjusted_score
+            result.grade = _score_to_grade(result.score)
+            result.label = _score_to_label(
+                result.score,
+                yes_threshold=yes_threshold,
+                maybe_threshold=maybe_threshold,
+            )
+            if llm_review.reason:
+                result.reasons.insert(0, f"LLM reviewer adjusted score by {llm_review.score_delta}: {llm_review.reason}")
+        elif llm_review.reason:
+            result.reasons.append(f"LLM reviewer kept score unchanged: {llm_review.reason}")
+        result.reasons = result.reasons[:4]
+        result.fit_summary = f"Grade {result.grade} ({result.score}/100). " + " ".join(result.reasons[:3])
+    return result
