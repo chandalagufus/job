@@ -1,0 +1,24 @@
+{
+  "sources": [
+    {
+      "name": "Vedansh",
+      "enabled": true,
+      "repo": "vedansh-adepu/ms-job-watcher",
+      "ref": "main",
+      "files": [
+        "data/boards/JOB_BOARDS_PURE_WORKING_SUPPORTED_round2.csv",
+        "data/boards/greenhouse_lever_verified_live.csv"
+      ]
+    },
+    {
+      "name": "Rohith",
+      "enabled": true,
+      "repo": "Rohith066/job-radar",
+      "ref": "main",
+      "files": [
+        "data/boards/JOB_BOARDS_PURE_WORKING_SUPPORTED_round2.csv",
+        "data/boards/greenhouse_lever_verified_live.csv"
+      ]
+    }
+  ]
+}

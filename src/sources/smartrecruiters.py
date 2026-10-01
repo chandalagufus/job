@@ -1,7 +1,9 @@
 """SmartRecruiters ATS board source adapter."""
 from __future__ import annotations
 
+from html import unescape
 import logging
+import os
 import re
 from urllib.parse import urlparse
 
@@ -45,7 +47,26 @@ def _board_id(board_url: str) -> str:
 def _extract_description(detail: dict) -> str:
     if not isinstance(detail, dict):
         return ""
-    sections = detail.get("jobAd", {}).get("sections") or detail.get("sections") or []
+    job_ad = detail.get("jobAd")
+    sections = (job_ad.get("sections") if isinstance(job_ad, dict) else None) or detail.get("sections") or []
+    if isinstance(sections, dict):
+        section_titles = {
+            "companyDescription": "Company Description",
+            "jobDescription": "Job Description",
+            "qualifications": "Qualifications",
+            "additionalInformation": "Additional Information",
+        }
+        normalized_sections = []
+        for key, section in sections.items():
+            title = section_titles.get(key, re.sub(r"([a-z])([A-Z])", r"\1 \2", key))
+            if isinstance(section, str):
+                section = {"text": section}
+            if isinstance(section, dict):
+                normalized_sections.append({
+                    **section,
+                    "title": section.get("title") or section.get("name") or title,
+                })
+        sections = normalized_sections
     parts: list[str] = []
     if isinstance(sections, list):
         for section in sections:
@@ -55,7 +76,7 @@ def _extract_description(detail: dict) -> str:
             text = str(section.get("text") or section.get("content") or "").strip()
             if text:
                 cleaned = re.sub(r"<[^>]+>", " ", text)
-                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                cleaned = re.sub(r"\s+", " ", unescape(cleaned)).strip()
                 parts.append(f"{title}: {cleaned}" if title else cleaned)
     structured = merge_text(
         parts,
@@ -85,13 +106,14 @@ def _should_fetch_detail(title: str, *, label: str, budget_remaining: int) -> bo
 class SmartRecruitersSource(BaseSource):
     """Fetches jobs from a single SmartRecruiters board."""
 
-    def __init__(self, company: str, board_url: str) -> None:
+    def __init__(self, company: str, board_url: str, *, max_jobs: int | None = None) -> None:
         slug = _company_slug(board_url)
         self.name = f"smartrecruiters:{slug}"
         self.company = company
         self.board_url = board_url
         self._slug = slug
         self.board_id = _board_id(board_url)
+        self.max_jobs = max(1, int(max_jobs if max_jobs is not None else os.environ.get("SMARTRECRUITERS_MAX_JOBS", "5000")))
 
     def fetch(self, seen_keys: set[str], timeout: int = 30) -> list[Job]:
         if not self._slug:
@@ -103,7 +125,8 @@ class SmartRecruitersSource(BaseSource):
         all_raw: list[dict] = []
         offset = 0
         limit = 100
-        safety_cap = 5000
+        seen_ids: set[str] = set()
+        total = None
 
         while True:
             url = f"{_API_BASE}/{self._slug}/postings"
@@ -111,15 +134,30 @@ class SmartRecruitersSource(BaseSource):
             r.raise_for_status()
 
             data = r.json() if r.content else {}
-            posts = data.get("content") or data.get("postings") or []
-            if not isinstance(posts, list) or not posts:
+            posts = data.get("content", data.get("postings")) if isinstance(data, dict) else None
+            if not isinstance(posts, list):
+                raise ValueError(f"Unexpected SmartRecruiters listing schema for {self._slug}")
+            if not posts:
                 break
 
-            all_raw.extend(posts)
-            if len(all_raw) >= 500:
+            fresh = []
+            for post in posts:
+                ident = str(post.get("id") or post.get("ref") or "")
+                if not ident or ident not in seen_ids:
+                    fresh.append(post)
+                    if ident:
+                        seen_ids.add(ident)
+            if not fresh:
+                log.warning("smartrecruiters:%s: repeated page at offset %s; stopping pagination", self._slug, offset)
                 break
+            all_raw.extend(fresh[: self.max_jobs - len(all_raw)])
             offset += len(posts)
-            if offset >= safety_cap:
+            raw_total = data.get("totalFound")
+            total = int(raw_total) if str(raw_total).isdigit() else None
+            if len(all_raw) >= self.max_jobs and (total is None or total > len(all_raw)):
+                log.warning("smartrecruiters:%s: truncated at %s jobs (API total=%s); raise SMARTRECRUITERS_MAX_JOBS to expand coverage", self._slug, self.max_jobs, total)
+                break
+            if total is not None and offset >= total:
                 break
 
         result: list[Job] = []

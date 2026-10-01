@@ -16,3 +16,6 @@ state/*.db-wal
 state/*.csv
 !state/gha-jobs.db
 !state/gha-dead_boards.csv
+
+# Private snapshot archives contain notes and generated resumes.
+state/snapshot-archives/

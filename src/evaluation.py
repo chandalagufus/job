@@ -16,6 +16,7 @@ from .classifier import (
     classify,
 )
 from .config import Config
+from .job_requirements import mandatory_experience_text
 from .llm_scorer import apply_llm_delta, maybe_review_job
 from .profile import PROFILE, SKILLS_MODERATE, SKILLS_STRONG
 from .scoring_policy import DEFAULT_MAYBE_THRESHOLD, DEFAULT_YES_THRESHOLD, label_for_score
@@ -331,6 +332,15 @@ def _find_jd_headings(description: str) -> list[tuple[int, int, str]]:
                 headings.append((match.start(), match.end(), section))
             for match in inline_pattern.finditer(text):
                 headings.append((match.start(), match.end(), section))
+            # ATS/LinkedIn descriptions can flatten headings onto one line.
+            # Use only unambiguous qualification labels, not generic prose.
+            if alias in {
+                "basic qualifications", "minimum qualifications", "minimum qualification",
+                "required qualifications", "required qualification",
+                "preferred qualifications", "preferred qualification",
+            }:
+                for match in re.finditer(rf"\b{re.escape(alias)}\b\s*:?", text, flags=re.IGNORECASE):
+                    headings.append((match.start(), match.end(), section))
     headings.sort(key=lambda item: item[0])
     deduped: list[tuple[int, int, str]] = []
     seen_positions: set[tuple[int, str]] = set()
@@ -616,6 +626,7 @@ def _source_is_strong_first_party(source: str) -> bool:
 
 
 def _extract_years_requirement(text: str) -> int:
+    text = mandatory_experience_text(text)
     normalized = (text or "").replace("–", "-").replace("—", "-")
     if not normalized:
         return 0
@@ -639,7 +650,8 @@ def _extract_years_requirement(text: str) -> int:
     # 4-year minimum, not a 7-year hard requirement.
     range_pattern = re.compile(
         r"\b(\d{1,2})\s*(?:-|to)\s*(\d{1,2})\+?\s+years?\s+(?:of\s+)?"
-        r"(?:total\s+)?(?:relevant\s+)?(?:professional\s+|work\s+|industry\s+)?(?:experience|exp)\b",
+        r"(?:total\s+)?(?:relevant\s+)?(?:professional\s+|work\s+|industry\s+)?"
+        r"(?:[a-z0-9+/#,\-\s]{0,80}\s+)?(?:experience|exp)\b",
         flags=re.IGNORECASE,
     )
     masked = normalized

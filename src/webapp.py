@@ -15,8 +15,9 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlencode
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 from wsgiref.simple_server import make_server
@@ -61,6 +62,7 @@ DATE_FORMATS = (
 )
 
 log = logging.getLogger(__name__)
+_DASHBOARD_MERGE_LOCK = threading.RLock()
 STATE_DB_FILENAMES = ("gha-jobs.db", "gha-boards.db")
 GITHUB_ARCHIVE_DB_FILENAME = "github-archive.db"
 BROAD_NON_WORKDAY_BOARDS_CSV = "data/boards/BROAD_NON_WORKDAY_EXTRA.csv"
@@ -159,27 +161,26 @@ def _dashboard_source_label(repo_root: str, path: Path) -> str:
     return resolved.parent.name or "local"
 
 
-def _copy_db_file(src: Path, dst: Path) -> None:
+def _copy_db_file(src: Path, dst: Path, *, max_seconds: float = 10.0) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    for sidecar in (
-        dst,
-        dst.with_name(dst.name + "-wal"),
-        dst.with_name(dst.name + "-shm"),
-    ):
-        try:
-            if sidecar.exists():
-                sidecar.unlink()
-        except OSError:
-            pass
-    source = sqlite3.connect(str(src), timeout=30)
-    target = sqlite3.connect(str(dst), timeout=30)
+    if dst.exists():
+        raise FileExistsError(f"Refusing to overwrite an existing database: {dst}")
+    started = time.monotonic()
+
+    def check_deadline(status: int, remaining: int, total: int) -> None:
+        if time.monotonic() - started >= max_seconds:
+            raise sqlite3.OperationalError(f"Database snapshot timed out after {max_seconds:g}s: {src}")
+
+    source = sqlite3.connect(src.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     try:
-        source.execute("PRAGMA busy_timeout=30000")
-        target.execute("PRAGMA busy_timeout=30000")
-        source.backup(target)
-        target.commit()
+        target = sqlite3.connect(str(dst), timeout=5)
+        try:
+            # sqlite3 backup retries BUSY indefinitely unless its progress hook aborts.
+            source.backup(target, pages=256, progress=check_deadline, sleep=0.05)
+            target.commit()
+        finally:
+            target.close()
     finally:
-        target.close()
         source.close()
 
 
@@ -551,6 +552,16 @@ def _safe_merge_dashboard_db(
     *,
     strategy_label: str,
 ) -> tuple[Path, str]:
+    with _DASHBOARD_MERGE_LOCK:
+        return _build_dashboard_merge(repo_root, snaps, strategy_label=strategy_label)
+
+
+def _build_dashboard_merge(
+    repo_root: str,
+    snaps: list[dict[str, object]],
+    *,
+    strategy_label: str,
+) -> tuple[Path, str]:
     if strategy_label == "merged-public+local":
         ordered = sorted(
             snaps,
@@ -573,15 +584,43 @@ def _safe_merge_dashboard_db(
             reverse=True,
         )
     base_snap = ordered[0]
-    overlays = ordered[1:]
-    merge_key = "|".join(
-        f"{Path(snap['path']).name}:{int(float(snap['fresh_ts']))}:{int(snap['total_jobs'])}" for snap in ordered
-    )
+    fingerprint = ["snapshot-v2", strategy_label]
+    for snap in ordered:
+        source_path = Path(snap["path"]).resolve()
+        for path in (source_path, source_path.with_name(source_path.name + "-wal")):
+            try:
+                stat = path.stat()
+                fingerprint.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
+            except FileNotFoundError:
+                fingerprint.append(f"{path}:missing")
+    merge_key = "|".join(fingerprint)
     merge_hash = hashlib.sha1(merge_key.encode("utf-8")).hexdigest()[:12]
     merged_name = f"dashboard-merged-{merge_hash}.db"
-    merged_path = (Path(repo_root) / "state" / merged_name).resolve() if repo_root else Path(base_snap["path"])
+    output_root = Path(repo_root) / "state" if repo_root else Path(base_snap["path"]).parent
+    merged_path = (output_root / merged_name).resolve()
     try:
-        with tempfile.TemporaryDirectory(prefix="job-radar-dashboard-merge-") as temp_dir:
+        merged_path.parent.mkdir(parents=True, exist_ok=True)
+        if merged_path.exists():
+            if _db_snapshot(merged_path).get("healthy"):
+                return merged_path, strategy_label
+            # An invalid cached file may still be open elsewhere. Leave it untouched.
+            merged_path = merged_path.with_name(f"{merged_path.stem}-{uuid.uuid4().hex[:12]}.db")
+        source_bytes = 0
+        for snap in ordered:
+            source_path = Path(snap["path"])
+            source_bytes += source_path.stat().st_size
+            wal_path = source_path.with_name(source_path.name + "-wal")
+            if wal_path.exists():
+                source_bytes += wal_path.stat().st_size
+        # Budget for input copies, merged output, SQLite journals, and headroom.
+        required_bytes = max(1024 ** 3, 4 * source_bytes + 512 * 1024 ** 2)
+        free_bytes = shutil.disk_usage(merged_path.parent).free
+        if free_bytes < required_bytes:
+            raise OSError(
+                f"Insufficient free space for dashboard merge: need {required_bytes / 1024 ** 3:.2f} GiB, "
+                f"available {free_bytes / 1024 ** 3:.2f} GiB. Existing snapshots retained."
+            )
+        with tempfile.TemporaryDirectory(prefix="job-radar-dashboard-merge-", dir=merged_path.parent) as temp_dir:
             temp_root = Path(temp_dir)
             snapshot_paths: list[Path] = []
             for index, snap in enumerate(ordered):
@@ -589,43 +628,26 @@ def _safe_merge_dashboard_db(
                 _copy_db_file(Path(snap["path"]), snapshot_path)
                 snapshot_paths.append(snapshot_path)
 
-            _copy_db_file(snapshot_paths[0], merged_path)
+            staged_path = temp_root / "merged.db"
+            _copy_db_file(snapshot_paths[0], staged_path)
             prefer_base_on_conflict = strategy_label == "merged-public+local"
             for overlay_path in snapshot_paths[1:]:
                 _merge_jobs_into(
-                    merged_path,
+                    staged_path,
                     overlay_path,
                     prefer_base_on_conflict=prefer_base_on_conflict,
                 )
-                _merge_boards_into(merged_path, overlay_path)
-                _merge_source_runs_into(merged_path, overlay_path)
+                _merge_boards_into(staged_path, overlay_path)
+                _merge_source_runs_into(staged_path, overlay_path)
+            finished = sqlite3.connect(str(staged_path))
+            try:
+                finished.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                finished.execute("PRAGMA journal_mode=DELETE")
+            finally:
+                finished.close()
+            os.replace(staged_path, merged_path)
         return merged_path, strategy_label
     except (sqlite3.Error, OSError) as exc:
-        try:
-            _copy_db_file(Path(base_snap["path"]), merged_path)
-            prefer_base_on_conflict = strategy_label == "merged-public+local"
-            for overlay_snap in overlays:
-                overlay_path = Path(overlay_snap["path"])
-                if not overlay_path.exists():
-                    continue
-                overlay_snapshot = merged_path.with_name(f"{merged_path.stem}-overlay-{hashlib.sha1(str(overlay_path).encode('utf-8')).hexdigest()[:8]}.db")
-                try:
-                    _copy_db_file(overlay_path, overlay_snapshot)
-                    _merge_jobs_into(
-                        merged_path,
-                        overlay_snapshot,
-                        prefer_base_on_conflict=prefer_base_on_conflict,
-                    )
-                    _merge_boards_into(merged_path, overlay_snapshot)
-                    _merge_source_runs_into(merged_path, overlay_snapshot)
-                finally:
-                    try:
-                        overlay_snapshot.unlink()
-                    except OSError:
-                        pass
-            return merged_path, strategy_label
-        except (sqlite3.Error, OSError):
-            pass
         base_path = Path(base_snap["path"])
         log.warning(
             "Dashboard DB merge failed for %s: %s. Falling back to %s.",
@@ -3074,6 +3096,9 @@ def serve_web(
         body = (
             "<div class=\"card\">"
             "<h1>Board Health</h1>"
+            "<p class=\"muted\">Degraded means the last probe returned no jobs, not necessarily a broken board. "
+            "Broken means a request or parser failure. Dead records are historical 404/410 responses, retried after 30 days. "
+            "Cooldown skips make no network request and do not count as fresh failures.</p>"
             "<p class=\"muted\">Track which ATS boards are healthy, which ones are degrading, and which ones are effectively dead before they waste scan time.</p>"
             "<div class=\"stats\">"
             f"<div class=\"stat\"><strong>{stats['total']}</strong><span>Total boards</span></div>"
@@ -3295,6 +3320,10 @@ def serve_web(
         path = environ.get("PATH_INFO", "/") or "/"
         method = environ.get("REQUEST_METHOD", "GET").upper()
         query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+        if method == "GET" and path in {"/scan", "/scan/"}:
+            # Opening the action URL must not launch a scan.
+            query.setdefault("dataset", [current_dataset_preference])
+            return _redirect(start_response, "/?" + urlencode(query, doseq=True))
         if method == "GET":
             dataset_choice = ((query.get("dataset") or [current_dataset_preference])[-1] or current_dataset_preference).strip().lower()
             source_signature = _dashboard_source_signature(dataset_choice)
@@ -3561,11 +3590,14 @@ def serve_web(
         except Exception as exc:
             log.warning("Dashboard DB refresh after startup sync failed: %s", exc)
 
-    threading.Thread(
-        target=_run_startup_github_sync,
-        name="job-radar-startup-github-sync",
-        daemon=True,
-    ).start()
+    if os.environ.get("JOB_RADAR_SKIP_STARTUP_GITHUB_SYNC") == "1":
+        log.info("Automatic startup GitHub sync skipped; existing snapshots retained. Manual sync remains available.")
+    else:
+        threading.Thread(
+            target=_run_startup_github_sync,
+            name="job-radar-startup-github-sync",
+            daemon=True,
+        ).start()
 
     try:
         with make_server(host, port, app) as httpd:

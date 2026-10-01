@@ -6,6 +6,7 @@ import json
 import re
 from urllib.parse import urlsplit, urlunsplit
 
+from .job_requirements import mandatory_experience_text
 from .profile import PROFILE
 
 
@@ -376,8 +377,9 @@ def extract_structured_fields(title: str, description: str, *, location: str = "
             data["salary_currency"] = "USD" if currency == "$" else currency
             data["salary_period"] = _salary_period_name(salary_match.group("period") or "")
 
-    years_matches = [match for match in _YEARS_RE.finditer(text) if _accepted_years_match(match, text)]
-    years_match = _select_years_match_for_candidate(years_matches, text)
+    years_text = mandatory_experience_text(text)
+    years_matches = [match for match in _YEARS_RE.finditer(years_text) if _accepted_years_match(match, years_text)]
+    years_match = _select_years_match_for_candidate(years_matches, years_text)
     if years_match:
         data["years_experience_min"] = int(years_match.group("min"))
         if years_match.group("max"):

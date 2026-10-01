@@ -254,7 +254,7 @@ zoox,lever,https://jobs.lever.co/zoox,,
 Accenture Federal Services,smartrecruiters,https://careers.smartrecruiters.com/AccentureFederalServices,,
 Apartments.com,smartrecruiters,https://jobs.smartrecruiters.com/Apartments,,
 AppFolio,smartrecruiters,https://jobs.smartrecruiters.com/AppFolio,,
-Bosch,smartrecruiters,https://jobs.smartrecruiters.com/Bosch,,
+Bosch,smartrecruiters,https://jobs.smartrecruiters.com/BoschGroup,,
 Buildium,smartrecruiters,https://jobs.smartrecruiters.com/Buildium,,
 CoStar Group,smartrecruiters,https://jobs.smartrecruiters.com/CoStarGroup,,
 Compass,smartrecruiters,https://jobs.smartrecruiters.com/Compass,,
@@ -301,9 +301,9 @@ Cisco Systems,workday,https://cisco.wd5.myworkdayjobs.com/Cisco_Careers,US,Verif
 Citigroup,workday,https://citi.wd5.myworkdayjobs.com/2,,
 Coca-Cola,workday,https://coke.wd1.myworkdayjobs.com/coca-cola-careers,US,Verified Fortune 500 Workday board
 Comcast,workday,https://comcast.wd5.myworkdayjobs.com/Comcast_Careers,,
-Dell Technologies,workday,https://dell.wd1.myworkdayjobs.com/External,,
+Dell Technologies,oracle_hcm,https://enterpriseplatform.dell.com/hcmUI/CandidateExperience/en/sites/careers,,Verified Oracle HCM replacement
 Disney,workday,https://disney.wd5.myworkdayjobs.com/disneycareer,,
-Eli Lilly,workday,https://lilly.wd5.myworkdayjobs.com/LLY,US,Verified Fortune 500 Workday board
+Eli Lilly,workday,https://lilly.wd115.myworkdayjobs.com/LLY,US,Verified Workday host migration
 Fannie Mae,workday,https://fanniemae.wd1.myworkdayjobs.com/FannieMaeCareers,,
 Fidelity Investments,workday,https://fmr.wd1.myworkdayjobs.com/FidelityCareers,,
 Freddie Mac,workday,https://freddiemac.wd5.myworkdayjobs.com/External,,
@@ -834,7 +834,7 @@ Truist Financial,smartrecruiters,https://jobs.smartrecruiters.com/TruistFinancia
 Turner Construction,smartrecruiters,https://jobs.smartrecruiters.com/TurnerConstruction,US,
 Tyco,smartrecruiters,https://jobs.smartrecruiters.com/Tyco,US,
 Uber,smartrecruiters,https://jobs.smartrecruiters.com/Uber2,US,
-Ubisoft,smartrecruiters,https://jobs.smartrecruiters.com/Ubisoft,Global,
+Ubisoft,smartrecruiters,https://jobs.smartrecruiters.com/ubisoft2,Global,
 UBS,smartrecruiters,https://jobs.smartrecruiters.com/UBS,Global,
 Ulta,smartrecruiters,https://jobs.smartrecruiters.com/Ulta2,US,
 Unilever,smartrecruiters,https://jobs.smartrecruiters.com/Unilever,Global,

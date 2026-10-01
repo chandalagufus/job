@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Optional
 
 try:
@@ -947,6 +947,24 @@ class Database:
             ).fetchone()
         return row is not None and row["status"] == "dead"
 
+    def board_probe_due(self, board_id: str, url: str, *, dead_retry_days: int = 30) -> bool:
+        """Changed endpoints bypass old failures; dead endpoints get monthly retries."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT url, status, last_checked FROM boards WHERE board_id=?", (board_id,)
+            ).fetchone()
+        if row is None or str(row["url"] or "").rstrip("/") != url.rstrip("/"):
+            return True
+        if row["status"] != "dead":
+            return False
+        try:
+            checked = datetime.fromisoformat(str(row["last_checked"]).replace("Z", "+00:00"))
+            if checked.tzinfo is None:
+                checked = checked.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True
+        return datetime.now(timezone.utc) - checked >= timedelta(days=max(1, dead_retry_days))
+
     def is_board_bootstrapped(self, board_id: str) -> bool:
         with self._lock:
             row = self._conn.execute(
@@ -1050,6 +1068,8 @@ class Database:
                 INSERT INTO boards(board_id,platform,company,url,status,last_checked,job_count,fail_count,fail_reason,first_seen,last_seen)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(board_id) DO UPDATE SET
+                    url=excluded.url,
+                    company=excluded.company,
                     status=excluded.status,
                     last_checked=excluded.last_checked,
                     job_count=excluded.job_count,
@@ -1195,14 +1215,19 @@ class Database:
             where.append("mode=?")
             params.append(mode)
         if status:
-            where.append("status=?")
+            where.append("(CASE WHEN error_text='Board marked dead' THEN 'skipped' ELSE status END)=?")
             params.append(status)
         if where:
             sql.append("WHERE " + " AND ".join(where))
         sql.append("ORDER BY finished_at DESC, id DESC LIMIT ?")
         params.append(max(limit, 1))
         rows = self._conn.execute(" ".join(sql), tuple(params)).fetchall()
-        return [dict(r) for r in rows]
+        result = [dict(r) for r in rows]
+        for row in result:
+            if row["error_text"] == "Board marked dead":
+                row["status"] = "skipped"
+                row["error_text"] = "Skipped: cached dead board (no network request)"
+        return result
 
     def get_source_health(
         self,
@@ -1222,19 +1247,19 @@ class Database:
         for (_source_key, _entity_type), rows in grouped.items():
             latest = rows[0]
             basis = latest
-            if latest["status"] == "skipped" and str(latest["error_text"] or "").startswith("Skipped because board was checked within"):
+            if latest["status"] == "skipped":
                 basis = next((row for row in rows[1:] if row["status"] != "skipped"), latest)
-            recent = rows[:10]
+            recent = [row for row in rows if row["status"] != "skipped"][:10]
             successes = [row for row in recent if row["status"] == "success"]
             last_success = next((row["finished_at"] for row in rows if row["status"] == "success"), "")
-            last_error = next((row["error_text"] for row in rows if row["status"] != "success" and row["error_text"]), "")
+            last_error = next((row["error_text"] for row in rows if row["status"] == "error" and row["error_text"]), "")
             failure_streak = 0
             latest_jd_coverage = float(basis["jd_coverage"] or 0.0)
             latest_fetched = int(basis["fetched_count"] or 0)
             for row in rows:
                 if row["status"] in {"success", "empty"}:
                     break
-                if row["status"] == "skipped" and str(row["error_text"] or "").startswith("Skipped because board was checked within"):
+                if row["status"] == "skipped":
                     continue
                 failure_streak += 1
             success_rate = (100.0 * len(successes) / len(recent)) if recent else 0.0
@@ -1372,7 +1397,12 @@ class Database:
         """Delete jobs not seen within the last `days` days. Returns count deleted."""
         with self._tx() as conn:
             cur = conn.execute(
-                "DELETE FROM jobs WHERE last_seen < datetime('now', ?)",
+                """DELETE FROM jobs WHERE last_seen < datetime('now', ?)
+                AND COALESCE(pipeline_status, 'new') = 'new'
+                AND COALESCE(pipeline_notes, '') = '' AND COALESCE(follow_up_date, '') = ''
+                AND COALESCE(viewed_at, '') = '' AND COALESCE(manual_input, 0) = 0
+                AND key NOT IN (SELECT job_key FROM feedback)
+                AND key NOT IN (SELECT job_key FROM generated_resumes)""",
                 (f"-{days} days",),
             )
             deleted = cur.rowcount

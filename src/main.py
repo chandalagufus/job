@@ -69,6 +69,7 @@ from .sources.wellfound import WellfoundSource, _board_id as wellfound_board_id
 from .sources.workatastartup import WorkAtAStartupSource, _board_id as workatastartup_board_id
 from .sources.generic_html import GenericJobsHTMLBoardSource, board_id as generic_html_board_id
 from .webapp import serve_web
+from .sources.dell import DellSource
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -76,7 +77,7 @@ ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 SUPPORTED_BOARD_PLATFORMS = (
     "greenhouse", "lever", "smartrecruiters", "workday", "ashby", "workable", "jobvite", "icims",
     "recruitee", "breezyhr", "teamtailor", "dover", "gem", "wellfound", "workatastartup",
-    "generic_html",
+    "generic_html", "oracle_hcm",
 )
 
 log = logging.getLogger(__name__)
@@ -697,6 +698,7 @@ def _fetch_source_metrics(source, db: Database, timeout: int) -> tuple[list[Job]
 # ---------------------------------------------------------------------------
 
 _BOARD_SEMAPHORES: dict[str, threading.Semaphore] = {
+    "oracle_hcm": threading.Semaphore(2),
     "greenhouse": threading.Semaphore(8),
     "lever": threading.Semaphore(8),
     "smartrecruiters": threading.Semaphore(6),
@@ -925,6 +927,8 @@ def _board_source_for(b: dict) -> Optional[object]:
     platform = b["platform"]
     company = b["company"]
     url = b["board_url"]
+    if platform == "oracle_hcm":
+        return DellSource(company, url)
     if platform == "greenhouse":
         return GreenhouseSource(company, url)
     if platform == "lever":
@@ -963,6 +967,8 @@ def _board_source_for(b: dict) -> Optional[object]:
 def _get_board_id(b: dict) -> str:
     platform = b["platform"]
     url = b["board_url"]
+    if platform == "oracle_hcm":
+        return DellSource.board_id
     if platform == "greenhouse":
         return gh_board_id(url)
     if platform == "lever":
@@ -1031,12 +1037,13 @@ def _process_one_board(
             "job_keys": [job.key for job in jobs],
         }
 
-    if db.is_board_dead(board_id):
-        return [], None, _record(status="error", jobs=[], error_text="Board marked dead")
-    if db.should_skip_board(board_id):
+    force_probe = db.board_probe_due(board_id, url)
+    if db.is_board_dead(board_id) and not force_probe:
+        return [], None, _record(status="skipped", jobs=[], error_text="Skipped: cached dead board; monthly recheck not due")
+    if not force_probe and db.should_skip_board(board_id):
         log.debug("Skipping board with repeated recent failures: %s", board_id)
         return [], None, _record(status="skipped", jobs=[], error_text="Skipped after repeated recent failures")
-    if db.was_board_checked_recently(board_id, cooldown_hours=board_rescan_cooldown_hours):
+    if not force_probe and db.was_board_checked_recently(board_id, cooldown_hours=board_rescan_cooldown_hours):
         log.debug("Skipping recently checked board: %s", board_id)
         return [], None, _record(
             status="skipped",
