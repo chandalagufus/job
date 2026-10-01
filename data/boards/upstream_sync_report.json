@@ -1,0 +1,38 @@
+{
+  "checked_at": "2026-10-01T10:57:16.303530+00:00",
+  "sources": [
+    {
+      "url": "https://raw.githubusercontent.com/vedansh-adepu/ms-job-watcher/main/data/boards/JOB_BOARDS_PURE_WORKING_SUPPORTED_round2.csv",
+      "accepted_rows": 1123
+    },
+    {
+      "url": "https://raw.githubusercontent.com/vedansh-adepu/ms-job-watcher/main/data/boards/greenhouse_lever_verified_live.csv",
+      "accepted_rows": 6166
+    },
+    {
+      "url": "https://raw.githubusercontent.com/Rohith066/job-radar/main/data/boards/JOB_BOARDS_PURE_WORKING_SUPPORTED_round2.csv",
+      "accepted_rows": 831
+    },
+    {
+      "url": "https://raw.githubusercontent.com/Rohith066/job-radar/main/data/boards/greenhouse_lever_verified_live.csv",
+      "accepted_rows": 6166
+    }
+  ],
+  "checks": [
+    {
+      "board_id": "smartrecruiters:bosch",
+      "checked_at": "2026-10-01T10:57:16.303530+00:00",
+      "live": false,
+      "reason": "Zero jobs; not proof of a dead board"
+    },
+    {
+      "board_id": "smartrecruiters:ubisoft",
+      "checked_at": "2026-10-01T10:57:16.303530+00:00",
+      "live": false,
+      "reason": "Zero jobs; not proof of a dead board"
+    }
+  ],
+  "added": [],
+  "replacement_candidates": [],
+  "errors": []
+}

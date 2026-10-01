@@ -1,0 +1,14 @@
+{
+  "smartrecruiters:bosch": {
+    "board_id": "smartrecruiters:bosch",
+    "checked_at": "2026-10-01T10:57:16.303530+00:00",
+    "live": false,
+    "reason": "Zero jobs; not proof of a dead board"
+  },
+  "smartrecruiters:ubisoft": {
+    "board_id": "smartrecruiters:ubisoft",
+    "checked_at": "2026-10-01T10:57:16.303530+00:00",
+    "live": false,
+    "reason": "Zero jobs; not proof of a dead board"
+  }
+}
