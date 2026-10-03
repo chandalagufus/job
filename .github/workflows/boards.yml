@@ -40,6 +40,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Restore durable scan state
+        run: python -m src.snapshot_transfer restore state/gha-boards.db
+
       - name: Run board sweep
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
@@ -64,27 +67,25 @@ jobs:
         run: python -m src.main --mode boards --dry-run --export-dead-csv state/gha-dead_boards.csv
         continue-on-error: true
 
-      - name: Compact boards database
-        run: |
-          if [ -f state/gha-boards.db ]; then
-            python -c "import sqlite3; from pathlib import Path; db_path = Path('state/gha-boards.db'); conn = sqlite3.connect(db_path); conn.execute('PRAGMA wal_checkpoint(TRUNCATE)'); conn.execute('VACUUM'); conn.close(); print(f'Compacted {db_path}: {db_path.stat().st_size} bytes')"
-          fi
+      - name: Preserve recovery state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boards-state-${{ github.run_id }}
+          path: state/gha-boards.db*
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Compress and validate boards state
+        run: python -m src.snapshot_transfer pack state/gha-boards.db
 
       - name: Commit state
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          MAX_BYTES=$((95 * 1024 * 1024))
-          if [ -f state/gha-boards.db ]; then
-            DB_BYTES=$(wc -c < state/gha-boards.db)
-            echo "state/gha-boards.db size: ${DB_BYTES} bytes"
-            if [ "$DB_BYTES" -le "$MAX_BYTES" ]; then
-              git add -f state/gha-boards.db
-            else
-              echo "::warning file=state/gha-boards.db::Skipping boards DB commit because ${DB_BYTES} bytes exceeds the 95 MiB safety threshold for GitHub's 100 MB file limit."
-              git restore --worktree state/gha-boards.db
-            fi
-          fi
+          git add -f state/gha-boards.db.gz
+          # Fresh state is now in the validated gzip; keep the legacy file unchanged.
+          git restore --worktree state/gha-boards.db
           if [ -f state/gha-dead_boards.csv ]; then git add state/gha-dead_boards.csv; fi
           if git diff --cached --quiet; then
             exit 0

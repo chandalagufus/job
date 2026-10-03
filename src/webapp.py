@@ -24,6 +24,7 @@ from wsgiref.simple_server import make_server
 
 from .config import Config
 from .database import Database
+from .snapshot_transfer import unpack as unpack_snapshot, validate as validate_snapshot
 from .evaluation import EVAL_CFG, EVALUATION_PAYLOAD_VERSION, EvaluationDimension, EvaluationResult, evaluate_job
 from .job_intelligence import extract_workday_req_id
 from .llm_scorer import apply_llm_delta, review_jobs_batch
@@ -70,6 +71,18 @@ BROAD_NON_WORKDAY_CURSOR_KEY = "boards_broad_non_workday"
 BROAD_NON_WORKDAY_BATCH_SIZE = 300
 LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 GITHUB_SYNC_SOURCES = (
+    {
+        "name": "Your GitHub boards snapshot",
+        "slug": "origin-boards",
+        "provenance": "github-mine",
+        "url": "https://raw.githubusercontent.com/chandalagufus/job/main/state/gha-boards.db.gz",
+    },
+    {
+        "name": "Your GitHub broad boards snapshot",
+        "slug": "origin-broad",
+        "provenance": "github-mine",
+        "url": "https://raw.githubusercontent.com/chandalagufus/job/main/state/gha-boards-broad-non-workday.db.gz",
+    },
     {
         "name": "Your GitHub jobs snapshot",
         "slug": "origin",
@@ -187,8 +200,15 @@ def _copy_db_file(src: Path, dst: Path, *, max_seconds: float = 10.0) -> None:
 def _download_remote_db(url: str, dst: Path, *, timeout: int = 180) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     req = Request(url, headers={"User-Agent": "job-radar-dashboard/1.0"})
-    with urlopen(req, timeout=timeout) as resp, open(dst, "wb") as out:
-        shutil.copyfileobj(resp, out)
+    with tempfile.TemporaryDirectory(dir=dst.parent) as tmp:
+        downloaded = Path(tmp) / "download"
+        with urlopen(req, timeout=timeout) as resp, downloaded.open("wb") as out:
+            shutil.copyfileobj(resp, out)
+        if url.endswith(".gz"):
+            unpack_snapshot(downloaded, dst)
+        else:
+            validate_snapshot(downloaded)
+            os.replace(downloaded, dst)
 
 
 def _import_missing_jobs_from_db(
@@ -1773,16 +1793,7 @@ def serve_web(
             return False, "GitHub sync is already in progress."
         github_archive_path = _github_archive_db_path(Path(repo_root).resolve() if repo_root else Path.cwd().resolve())
         try:
-            for sidecar in (
-                github_archive_path,
-                github_archive_path.with_name(github_archive_path.name + "-wal"),
-                github_archive_path.with_name(github_archive_path.name + "-shm"),
-            ):
-                try:
-                    if sidecar.exists():
-                        sidecar.unlink()
-                except OSError:
-                    pass
+            # Keep existing jobs and first-seen dates, even if a source fails.
             Database(str(github_archive_path)).close()
         except Exception as exc:
             github_sync_lock.release()
@@ -1791,6 +1802,7 @@ def serve_web(
         try:
             summaries: list[str] = []
             total_inserted = 0
+            failures = 0
             for source in GITHUB_SYNC_SOURCES:
                 slug = str(source["slug"])
                 url = str(source["url"])
@@ -1805,7 +1817,8 @@ def serve_web(
                         prefer_overlay_scores=(slug == "rohith"),
                         provenance_label=provenance_label,
                     )
-                except (OSError, sqlite3.Error, URLError) as exc:
+                except (OSError, sqlite3.Error, URLError, ValueError, EOFError, RuntimeError) as exc:
+                    failures += 1
                     log.warning("GitHub archive sync failed for %s: %s", source["name"], exc)
                     summaries.append(f"{source['name']}: failed")
                     continue
@@ -1814,6 +1827,8 @@ def serve_web(
                 total_inserted += inserted
                 summaries.append(f"{source['name']}: +{inserted} new, {updated} enriched")
             _replace_dashboard_db(current_dataset_preference)
+            if failures:
+                return False, f"GitHub sync incomplete; previous data retained. {' | '.join(summaries)}"
             if total_inserted > 0:
                 return True, f"GitHub sync completed. {' | '.join(summaries)}"
             return True, f"GitHub sync completed with no new jobs added. {' | '.join(summaries)}"
