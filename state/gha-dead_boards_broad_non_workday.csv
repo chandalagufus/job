@@ -1,7 +1,10 @@
 board_id,platform,company,url,fail_count,fail_reason,last_checked
+greenhouse:1910genetics,greenhouse,1910genetics,https://boards.greenhouse.io/1910genetics,1,HTTP 404,2026-10-09T22:53:07.572921+00:00
+greenhouse:7shifts,greenhouse,7shifts,https://boards.greenhouse.io/7shifts,1,HTTP 404,2026-10-09T22:53:08.187764+00:00
 greenhouse:a16zcryptoteam,greenhouse,a16zcryptoteam,https://boards.greenhouse.io/a16zcryptoteam,2,HTTP 404,2026-10-03T18:49:29.233458+00:00
 greenhouse:abclabs,greenhouse,abclabs,https://boards.greenhouse.io/abclabs,2,HTTP 404,2026-10-03T18:49:29.594628+00:00
 greenhouse:absci,greenhouse,absci,https://boards.greenhouse.io/absci,2,HTTP 404,2026-10-03T18:49:29.683409+00:00
+greenhouse:acrisureinnovation,greenhouse,acrisureinnovation,https://boards.greenhouse.io/acrisureinnovation,6,HTTP 404,2026-10-09T22:53:09.966950+00:00
 greenhouse:actpowerservices,greenhouse,actpowerservices,https://boards.greenhouse.io/actpowerservices,1,HTTP 404,2026-10-03T18:49:30.515575+00:00
 greenhouse:adaptivewater,greenhouse,adaptivewater,https://boards.greenhouse.io/adaptivewater,2,HTTP 404,2026-10-03T18:49:30.734446+00:00
 greenhouse:affinity,greenhouse,affinity,https://boards.greenhouse.io/affinity,6,HTTP 404,2026-10-03T18:49:31.233223+00:00
@@ -11,6 +14,7 @@ greenhouse:alpineinvestors,greenhouse,alpineinvestors,https://boards.greenhouse.
 greenhouse:alt,greenhouse,alt,https://boards.greenhouse.io/alt,2,HTTP 404,2026-10-03T18:49:33.661725+00:00
 greenhouse:ambiententerprises,greenhouse,ambiententerprises,https://boards.greenhouse.io/ambiententerprises,3,HTTP 404,2026-09-09T23:29:56.382495+00:00
 greenhouse:amenitiz,greenhouse,amenitiz,https://boards.greenhouse.io/amenitiz,2,HTTP 404,2026-10-03T18:49:34.199712+00:00
+greenhouse:anchanto,greenhouse,anchanto,https://boards.greenhouse.io/anchanto,1,HTTP 404,2026-10-09T22:53:15.873335+00:00
 greenhouse:arcadiacareers,greenhouse,arcadiacareers,https://boards.greenhouse.io/arcadiacareers,2,HTTP 404,2026-10-04T00:02:07.406602+00:00
 greenhouse:arine,greenhouse,arine,https://boards.greenhouse.io/arine,2,HTTP 404,2026-10-04T00:02:07.923167+00:00
 greenhouse:armracolostrum,greenhouse,armracolostrum,https://boards.greenhouse.io/armracolostrum,5,HTTP 404,2026-10-04T00:02:08.147315+00:00
