@@ -1,5 +1,6 @@
 board_id,platform,company,url,fail_count,fail_reason,last_checked
 greenhouse:1910genetics,greenhouse,1910genetics,https://boards.greenhouse.io/1910genetics,1,HTTP 404,2026-10-09T22:53:07.572921+00:00
+greenhouse:1uphealth,greenhouse,1uphealth,https://boards.greenhouse.io/1uphealth,4,HTTP 404,2026-10-20T05:14:35.406011+00:00
 greenhouse:7shifts,greenhouse,7shifts,https://boards.greenhouse.io/7shifts,1,HTTP 404,2026-10-09T22:53:08.187764+00:00
 greenhouse:a16zcryptoteam,greenhouse,a16zcryptoteam,https://boards.greenhouse.io/a16zcryptoteam,2,HTTP 404,2026-10-03T18:49:29.233458+00:00
 greenhouse:abclabs,greenhouse,abclabs,https://boards.greenhouse.io/abclabs,2,HTTP 404,2026-10-03T18:49:29.594628+00:00
@@ -9,10 +10,12 @@ greenhouse:actpowerservices,greenhouse,actpowerservices,https://boards.greenhous
 greenhouse:adaptivewater,greenhouse,adaptivewater,https://boards.greenhouse.io/adaptivewater,2,HTTP 404,2026-10-03T18:49:30.734446+00:00
 greenhouse:affinity,greenhouse,affinity,https://boards.greenhouse.io/affinity,6,HTTP 404,2026-10-03T18:49:31.233223+00:00
 greenhouse:aiserajobs,greenhouse,aiserajobs,https://boards.greenhouse.io/aiserajobs,1,HTTP 404,2026-10-03T18:49:32.152540+00:00
-greenhouse:alpineinternships,greenhouse,alpineinternships,https://boards.greenhouse.io/alpineinternships,5,HTTP 404,2026-09-18T23:34:14.191188+00:00
+greenhouse:akoya,greenhouse,akoya,https://boards.greenhouse.io/akoya,2,HTTP 404,2026-10-20T05:14:41.549724+00:00
+greenhouse:alpineinternships,greenhouse,alpineinternships,https://boards.greenhouse.io/alpineinternships,6,HTTP 404,2026-10-20T05:14:42.838085+00:00
 greenhouse:alpineinvestors,greenhouse,alpineinvestors,https://boards.greenhouse.io/alpineinvestors,4,HTTP 404,2026-09-23T12:06:09.552374+00:00
 greenhouse:alt,greenhouse,alt,https://boards.greenhouse.io/alt,2,HTTP 404,2026-10-03T18:49:33.661725+00:00
 greenhouse:ambiententerprises,greenhouse,ambiententerprises,https://boards.greenhouse.io/ambiententerprises,4,HTTP 404,2026-10-15T17:20:21.615651+00:00
+greenhouse:amdaris,greenhouse,amdaris,https://boards.greenhouse.io/amdaris,1,HTTP 404,2026-10-20T05:14:43.457165+00:00
 greenhouse:amenitiz,greenhouse,amenitiz,https://boards.greenhouse.io/amenitiz,2,HTTP 404,2026-10-03T18:49:34.199712+00:00
 greenhouse:anchanto,greenhouse,anchanto,https://boards.greenhouse.io/anchanto,1,HTTP 404,2026-10-09T22:53:15.873335+00:00
 greenhouse:arcadiacareers,greenhouse,arcadiacareers,https://boards.greenhouse.io/arcadiacareers,2,HTTP 404,2026-10-04T00:02:07.406602+00:00
