@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-25T14:23:42.994041+00:00",
+  "checked_at": "2026-11-01T16:49:08.490349+00:00",
   "sources": [
     {
       "url": "https://raw.githubusercontent.com/vedansh-adepu/ms-job-watcher/main/data/boards/JOB_BOARDS_PURE_WORKING_SUPPORTED_round2.csv",
@@ -18,7 +18,20 @@
       "accepted_rows": 6166
     }
   ],
-  "checks": [],
+  "checks": [
+    {
+      "board_id": "smartrecruiters:bosch",
+      "checked_at": "2026-11-01T16:49:08.490349+00:00",
+      "live": false,
+      "reason": "Zero jobs; not proof of a dead board"
+    },
+    {
+      "board_id": "smartrecruiters:ubisoft",
+      "checked_at": "2026-11-01T16:49:08.490349+00:00",
+      "live": false,
+      "reason": "Zero jobs; not proof of a dead board"
+    }
+  ],
   "added": [],
   "replacement_candidates": [],
   "errors": []
